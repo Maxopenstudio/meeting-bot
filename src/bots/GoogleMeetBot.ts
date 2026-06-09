@@ -311,6 +311,23 @@ export class GoogleMeetBot extends MeetBotBase {
 
         await clickContinueWithoutDevicesIfPresent();
 
+        // DEBUG: dump the post-join page so we can read the EXACT localized button
+        // aria-labels + body text (e.g. Russian) and add them to the detectors.
+        try {
+          await new Promise((r) => setTimeout(r, 7000));
+          const dump = await this.page.evaluate(() => ({
+            url: location.href,
+            bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1200),
+            ariaLabels: Array.from(document.querySelectorAll('button[aria-label]'))
+              .map((b) => b.getAttribute('aria-label'))
+              .filter(Boolean)
+              .slice(0, 50),
+          }));
+          this._logger.info('POSTJOIN_DEBUG ' + JSON.stringify(dump));
+        } catch (e) {
+          this._logger.info('postjoin debug failed', { error: (e as Error)?.message });
+        }
+
         // Do this to ensure meeting bot has joined the meeting
         const wanderingTime = config.joinWaitTime * 60 * 1000; // Give some time to admit the bot
 
