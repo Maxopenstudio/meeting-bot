@@ -191,23 +191,29 @@ export class GoogleMeetBot extends MeetBotBase {
           }
         }
 
-        this._logger.info('Waiting for the input field to be visible...', {
+        // Guest joins show a name input; signed-in joins (GOOGLE_CHROME_STORAGE_STATE_PATH)
+        // don't — the name comes from the account. Probe briefly: if the field shows,
+        // fill it (guest); if not, we're signed in → skip straight to the join button
+        // instead of failing the whole join on a missing field.
+        this._logger.info('Probing for the name input field...', {
           joinRequestAttempt,
           maxJoinRequestAttempts
         });
-        await retryActionWithWait(
-          'Waiting for the input field',
-          async () => await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 10000 }),
-          this._logger,
-          3,
-          15000,
-          async () => {
-            await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'text-input-field-wait', userId, this._logger, botId);
-          }
-        );
+        let nameFieldVisible = false;
+        try {
+          await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 12000 });
+          nameFieldVisible = true;
+        } catch {
+          this._logger.info('No name input — signed-in session, skipping name step...', {
+            joinRequestAttempt,
+            maxJoinRequestAttempts
+          });
+        }
 
-        this._logger.info('Filling the input field with the name...');
-        await this.page.locator(nameInputSelector).first().fill(displayName);
+        if (nameFieldVisible) {
+          this._logger.info('Filling the input field with the name...');
+          await this.page.locator(nameInputSelector).first().fill(displayName);
+        }
         
         await retryActionWithWait(
           'Clicking the "Ask to join" button',
