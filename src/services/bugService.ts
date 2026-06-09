@@ -1,6 +1,7 @@
 import config, { NODE_ENV } from '../config';
 import { Storage } from '@google-cloud/storage';
 import { Logger } from 'winston';
+import { writeFile, mkdir } from 'fs/promises';
 
 interface UploadOption {
   skipTimestamp?: boolean;
@@ -31,6 +32,17 @@ export const uploadDebugImage = async (
   botId?: string,
   opts?: UploadOption
 ) => {
+  // Always dump a local copy to the mounted ./logs volume so operators can see
+  // what the bot saw even without GCP configured. Best-effort.
+  try {
+    const dir = '/app/logs/debug';
+    await mkdir(dir, { recursive: true });
+    const stamp = opts?.skipTimestamp ? '' : `-${Date.now()}`;
+    await writeFile(`${dir}/${botId ?? 'bot'}-${fileName}${stamp}.png`, buffer);
+  } catch (e) {
+    logger.error('Local debug image write failed', e as any);
+  }
+
   try {
     if (NODE_ENV === 'development') {
       // TODO add disk based file saving

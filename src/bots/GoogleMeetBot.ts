@@ -214,7 +214,21 @@ export class GoogleMeetBot extends MeetBotBase {
           this._logger.info('Filling the input field with the name...');
           await this.page.locator(nameInputSelector).first().fill(displayName);
         }
-        
+
+        // DEBUG: capture the pre-join screen right before we look for the join
+        // button — lets us see what the signed-in flow actually renders.
+        try {
+          await uploadDebugImage(
+            await this.page.screenshot({ type: 'png', fullPage: true }),
+            `prejoin-signedin-${nameFieldVisible ? 'guest' : 'signed'}`,
+            userId,
+            this._logger,
+            botId
+          );
+        } catch (e) {
+          this._logger.info('prejoin debug screenshot failed', { error: (e as Error)?.message });
+        }
+
         await retryActionWithWait(
           'Clicking the "Ask to join" button',
           async () => {
