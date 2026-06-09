@@ -86,13 +86,29 @@ export class GoogleMeetBot extends MeetBotBase {
     }
   }
 
+  // Force the Google Meet UI into English via the hl=en query param. For a
+  // signed-in session Meet usually honours the ACCOUNT language over this hint,
+  // so the real fix is the bot account's language setting — but appending hl=en
+  // is a harmless best-effort safety net (e.g. for guest joins / unset accounts).
+  private withEnglishLocale(meetUrl: string): string {
+    try {
+      const parsed = new URL(meetUrl);
+      parsed.searchParams.set('hl', 'en');
+      return parsed.toString();
+    } catch {
+      // Non-absolute / malformed URL — leave it untouched rather than break navigation.
+      return meetUrl;
+    }
+  }
+
   private async joinMeeting({ url, name, teamId, userId, eventId, botId, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
     this._logger.info('Launching browser...');
 
     this.page = await createBrowserContext(url, this._correlationId, 'google');
 
-    this._logger.info('Navigating to Google Meet URL...');
-    await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+    const meetUrl = this.withEnglishLocale(url);
+    this._logger.info('Navigating to Google Meet URL...', { meetUrl });
+    await this.page.goto(meetUrl, { waitUntil: 'domcontentloaded' });
 
     const nameInputSelector = 'input[type="text"]';
     const clickContinueWithoutDevicesIfPresent = async (timeout = 5000) => {
@@ -182,7 +198,7 @@ export class GoogleMeetBot extends MeetBotBase {
             teamId
           });
 
-          await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+          await this.page.goto(meetUrl, { waitUntil: 'domcontentloaded' });
 
           try {
             await waitForPreJoinReady();
