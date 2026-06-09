@@ -7,6 +7,7 @@ import microsoftRouter from './microsoft';
 import zoomRouter from './zoom';
 import { globalJobStore } from '../lib/globalJobStore';
 import { RedisConsumerService } from '../connect/RedisConsumerService';
+import { checkGoogleSessionHealth, SessionHealthResult } from '../lib/sessionHealth';
 
 const app = express();
 
@@ -26,11 +27,42 @@ app.get('/isbusy', async (req, res) => {
 
 app.get('/health', async (req, res) => {
   // Simple health check endpoint for Docker
-  return res.status(200).json({ 
-    status: 'healthy', 
+  return res.status(200).json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
+});
+
+// Liveness probe for the Google session (state.json). Launches a browser and
+// navigates to Meet to see whether the restored session is still signed in —
+// the backend polls this on a schedule and alerts (Telegram) when it goes dead,
+// so a stale session is caught BEFORE scheduled meetings silently fail to record.
+let lastSessionHealthAt = 0;
+let lastSessionHealth: SessionHealthResult | null = null;
+const SESSION_HEALTH_MIN_INTERVAL_MS = 60_000;
+
+app.get('/session-health', async (req, res) => {
+  // Single-concurrency bot: never launch a probe browser while a recording is
+  // in flight. A busy bot is, by definition, signed in and working.
+  if (globalJobStore.isBusy()) {
+    return res.status(200).json({ success: true, busy: true, signedIn: true, skipped: 'busy' });
+  }
+
+  // Cheap rate-limit so the endpoint can't be hammered into launching browsers.
+  const now = Date.now();
+  if (lastSessionHealth && now - lastSessionHealthAt < SESSION_HEALTH_MIN_INTERVAL_MS) {
+    return res.status(200).json({ success: true, busy: false, cached: true, ...lastSessionHealth });
+  }
+
+  try {
+    const result = await checkGoogleSessionHealth('session-health');
+    lastSessionHealthAt = now;
+    lastSessionHealth = result;
+    return res.status(200).json({ success: true, busy: false, cached: false, ...result });
+  } catch (e: any) {
+    return res.status(200).json({ success: false, error: e?.message || String(e) });
+  }
 });
 
 // Create a Gauge metric for busy status (0 or 1)
