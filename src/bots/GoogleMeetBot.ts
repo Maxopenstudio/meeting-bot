@@ -232,7 +232,11 @@ export class GoogleMeetBot extends MeetBotBase {
         await retryActionWithWait(
           'Clicking the "Ask to join" button',
           async () => {
-            // Using the Order of most probable detection
+            // Using the Order of most probable detection. Signed-in bots render
+            // Meet in the ACCOUNT's language (overriding the browser locale), so
+            // we match join-button text in EN / DE / RU / UA. Matching is
+            // case-insensitive substring, so e.g. 'Присоединиться' also catches
+            // 'Попросить присоединиться'.
             const possibleTexts = [
               'Ask to join',
               'Join now',
@@ -240,6 +244,10 @@ export class GoogleMeetBot extends MeetBotBase {
               'Teilnahme erbitten',
               'Jetzt teilnehmen',
               'Trotzdem teilnehmen',
+              'Присоединиться',                // RU: Join / Join now
+              'Попросить присоединиться',       // RU: Ask to join
+              'Приєднатися',                    // UA: Join / Join now
+              'Попросити дозвіл приєднатися',   // UA: Ask to join
             ];
 
             let buttonClicked = false;
