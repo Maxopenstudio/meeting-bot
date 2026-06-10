@@ -11,7 +11,7 @@ import { browserLogCaptureCallback } from '../util/logger';
 import { getWaitingPromise } from '../lib/promise';
 import { retryActionWithWait } from '../util/resilience';
 import { uploadDebugImage } from '../services/bugService';
-import createBrowserContext, { isExternalBrowserContext } from '../lib/chromium';
+import createBrowserContext, { isExternalBrowserContext, persistGoogleSessionState } from '../lib/chromium';
 import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
 import { getRecordingMimeTypesForExtension } from '../lib/recording';
 import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
@@ -19,6 +19,9 @@ import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
   private _correlationId: string;
+  // True when the pre-join screen had no name input, i.e. the Google session
+  // from state.json was accepted and we joined signed in (avatar account).
+  private _joinedWithSignedInSession = false;
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -65,6 +68,16 @@ export class GoogleMeetBot extends MeetBotBase {
 
       throw error;
     } finally {
+      // Persist the latest cookie rotation from the whole meeting before the
+      // browser goes away (Google may rotate again mid-meeting).
+      if (this._joinedWithSignedInSession) {
+        try {
+          await persistGoogleSessionState(this.page?.context(), this._correlationId);
+        } catch {
+          // persistGoogleSessionState never throws, but stay defensive here.
+        }
+      }
+
       // Guarantee chrome subprocess tree is reaped regardless of exit path.
       // No-op if a deeper code path already closed the browser.
       try {
@@ -219,12 +232,21 @@ export class GoogleMeetBot extends MeetBotBase {
         try {
           await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 12000 });
           nameFieldVisible = true;
+          if (config.googleChromeStorageStatePath) {
+            this._logger.warn('Name input shown despite a configured storage state — Google session is dead/stale, joining as GUEST...', {
+              joinRequestAttempt,
+              maxJoinRequestAttempts,
+              userId,
+              teamId
+            });
+          }
         } catch {
           this._logger.info('No name input — signed-in session, skipping name step...', {
             joinRequestAttempt,
             maxJoinRequestAttempts
           });
         }
+        this._joinedWithSignedInSession = !nameFieldVisible;
 
         if (nameFieldVisible) {
           this._logger.info('Filling the input field with the name...');
@@ -601,6 +623,14 @@ export class GoogleMeetBot extends MeetBotBase {
     }
 
     pushState('joined');
+
+    // Google rotated the bound-session cookies during this navigation; write
+    // them back so the next join/health-probe uses the live chain instead of
+    // the now-stale snapshot. Only for signed-in joins — persisting a guest
+    // context would overwrite a freshly uploaded session with empty cookies.
+    if (this._joinedWithSignedInSession) {
+      await persistGoogleSessionState(this.page.context(), this._correlationId);
+    }
 
     try {
       this._logger.info('Waiting for the "Got it" button...');

@@ -17,6 +17,33 @@ export function isExternalBrowserContext(context?: BrowserContext | null): boole
   return Boolean(context && externalBrowserContexts.has(context));
 }
 
+/**
+ * Write the context's current cookies back to the storage state file.
+ *
+ * Google binds its session to rotating __Secure-*PSIDTS cookies: every time the
+ * bot (or the session-health probe) navigates with state.json, Google rotates
+ * them server-side. If the rotated values are discarded — which is what happens
+ * when the context is simply closed — the file keeps the OLD cookie chain and
+ * the session dies after a use or two (observed: signed_in → signed_out within
+ * ~30 min, one health-probe cycle). Persisting after every signed-in use keeps
+ * the cookie chain alive indefinitely.
+ *
+ * Callers must only invoke this when the session was actually signed in —
+ * persisting a bounced/guest state would clobber a freshly uploaded session.
+ */
+export async function persistGoogleSessionState(context: BrowserContext | null | undefined, correlationId: string): Promise<void> {
+  const log = getCorrelationIdLog(correlationId);
+  const statePath = config.googleChromeStorageStatePath;
+  if (!statePath || !context || isExternalBrowserContext(context)) return;
+
+  try {
+    await context.storageState({ path: statePath });
+    console.log(`${log} Persisted rotated Google session cookies to storage state file`);
+  } catch (err) {
+    console.warn(`${log} Failed to persist Google session storage state (non-fatal)`, err);
+  }
+}
+
 function attachBrowserErrorHandlers(browser: Browser | null, context: BrowserContext, page: Page, correlationId: string) {
   const log = getCorrelationIdLog(correlationId);
 

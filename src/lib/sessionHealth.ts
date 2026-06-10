@@ -1,6 +1,7 @@
 import { chromium } from 'playwright';
 import config from '../config';
 import { getCorrelationIdLog } from '../util/logger';
+import { persistGoogleSessionState } from './chromium';
 
 export interface SessionHealthResult {
   signedIn: boolean;
@@ -57,6 +58,15 @@ export async function checkGoogleSessionHealth(correlationId: string): Promise<S
     }).catch(() => null);
 
     console.log(`${log} session-health: signedIn=${signedIn} account=${account ?? '?'} url=${finalUrl}`);
+
+    // The probe navigation itself makes Google rotate the bound-session
+    // cookies. Without writing them back, every probe burns one rotation and
+    // the static state.json dies within an hour. Persist only on signed-in —
+    // a bounced state must not overwrite a freshly uploaded session.
+    if (signedIn) {
+      await persistGoogleSessionState(context, correlationId);
+    }
+
     return { signedIn, account, finalUrl, htmlLang, checkedAt: new Date().toISOString() };
   } finally {
     await browser.close().catch(() => {});
