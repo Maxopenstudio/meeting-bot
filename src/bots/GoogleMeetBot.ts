@@ -612,6 +612,15 @@ export class GoogleMeetBot extends MeetBotBase {
         throw new WaitingAtLobbyRetryError('Google Meet bot could not enter the meeting...', '', false, 0);
       }
     } catch(lobbyError) {
+      // Google rotated the bound-session cookies during this attempt even though
+      // the join failed (e.g. nobody admitted the bot). Write them back BEFORE
+      // closing the browser — otherwise the file keeps the already-used chain and
+      // Google revokes the whole session on its next use (observed on prod:
+      // lobby timeout → lost rotation → signed_out within 30 min).
+      if (this._joinedWithSignedInSession) {
+        await persistGoogleSessionState(this.page.context(), this._correlationId);
+      }
+
       this._logger.info('Closing the browser on error...', lobbyError);
       if (isExternalBrowserContext(this.page.context())) {
         await this.page.close();
