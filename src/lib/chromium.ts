@@ -11,6 +11,15 @@ chromium.use(stealthPlugin);
 
 export type BotType = 'microsoft' | 'google' | 'zoom';
 
+// Google binds its signed-in session partly to the User-Agent the session was
+// captured under. tools/bot-session/capture-session.js pins this exact string,
+// so the bot MUST replay the same UA — otherwise Google sees a different device
+// than the one that logged in, invalidates the bound session faster, and the
+// join silently degrades to anonymous guest. Keep this in sync with the capture
+// tool's BOT_USER_AGENT.
+const GOOGLE_SESSION_USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+
 const externalBrowserContexts = new WeakSet<BrowserContext>();
 
 export function isExternalBrowserContext(context?: BrowserContext | null): boolean {
@@ -191,7 +200,12 @@ async function createBrowserContext(url: string, correlationId: string, botType:
   const contextOptions = {
     ...(botType !== 'google' ? {
       permissions: ['camera', 'microphone'],
-    } : {}),
+    } : {
+      // Match the UA the signed-in session was captured under (see above), so
+      // Google keeps the bound session valid instead of treating each join as a
+      // new device and dropping the bot to guest.
+      userAgent: GOOGLE_SESSION_USER_AGENT,
+    }),
     viewport: size,
     ignoreHTTPSErrors: true,
     // Record video only in development for debugging. Keep Google Meet's
