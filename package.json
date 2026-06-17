@@ -9,6 +9,7 @@
     "dev": "docker compose up --build",
     "stop": "docker compose down",
     "build": "tsc",
+    "test": "node -r ts-node/register --test src/util/recordingName.test.ts",
     "lint": "eslint \"*/**/*.{js,ts}\" --quiet --fix"
   },
   "keywords": [],

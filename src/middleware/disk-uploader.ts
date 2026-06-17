@@ -1,11 +1,11 @@
 import { Logger } from 'winston';
 import {
   createPartUploadUrl,
-  fileNameTemplate,
   finalizeUpload,
   initializeMultipartUpload,
   uploadChunkToStorage
 } from '../services/uploadService';
+import { buildRecordingObjectKey } from '../util/recordingName';
 import { ContentType, extensionToContentType, FileType } from '../types';
 import fs, { createWriteStream } from 'fs';
 import path from 'path';
@@ -633,9 +633,16 @@ class DiskUploader implements IUploader {
     const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
     const chunkSize = this.UPLOAD_CHUNK_SIZE;
 
-    // Compose key to preserve existing S3 layout for parity
-    const fileName = fileNameTemplate(this._namePrefix, getTimeString(this._timezone, this._logger));
-    const key = `meeting-bot/${this._userId}/${fileName}${this.fileExtension}`;
+    // Compose key. The botId segment keeps the key unique per meeting so a new
+    // recording can never clobber an older one that landed in the same minute.
+    const key = buildRecordingObjectKey({
+      userId: this._userId,
+      botId: this._botId,
+      namePrefix: this._namePrefix,
+      time: getTimeString(this._timezone, this._logger),
+      fileExtension: this.fileExtension,
+    });
+    this._logger.info('Composed object storage key', { key, botId: this._botId, userId: this._userId });
 
     // Validate provider configuration before attempting upload
     provider.validateConfig();
