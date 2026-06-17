@@ -70,6 +70,21 @@ export default {
   googleChromeCdpUrl: process.env.GOOGLE_CHROME_CDP_URL,
   googleChromeUserDataDir: process.env.GOOGLE_CHROME_USER_DATA_DIR,
   googleChromeStorageStatePath: process.env.GOOGLE_CHROME_STORAGE_STATE_PATH,
+  // Role split for multi-replica deploys: the single 'keeper' owns the live
+  // persistent Chrome profile, keeps the Google session alive, and republishes a
+  // fresh read-only state.json snapshot; 'worker' (default) joins meetings using
+  // that snapshot read-only and never writes session cookies back (no clobber).
+  botRole: (process.env.BOT_ROLE === 'keeper' ? 'keeper' : 'worker') as 'keeper' | 'worker',
+  // How often the keeper exercises + republishes the session (minutes).
+  sessionKeeperIntervalMinutes: process.env.SESSION_KEEPER_INTERVAL_MINUTES ?
+    Number(process.env.SESSION_KEEPER_INTERVAL_MINUTES) :
+    20,
+  // Whether this instance may write rotated session cookies back to state.json.
+  // Default true (preserves the legacy single-instance behaviour). In a
+  // keeper+workers deploy, set SESSION_WRITEBACK=false on the worker pods so only
+  // the keeper writes the shared snapshot — otherwise concurrent workers clobber
+  // each other's rotated cookies and the session dies.
+  sessionWriteback: process.env.SESSION_WRITEBACK !== 'false',
   googleAnonymousJoinRequestAttempts: process.env.GOOGLE_ANONYMOUS_JOIN_REQUEST_ATTEMPTS ?
     Number(process.env.GOOGLE_ANONYMOUS_JOIN_REQUEST_ATTEMPTS) :
     10,

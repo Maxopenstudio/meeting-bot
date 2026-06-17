@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Browser, BrowserContext, Page } from 'playwright';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
@@ -17,8 +18,18 @@ export type BotType = 'microsoft' | 'google' | 'zoom';
 // than the one that logged in, invalidates the bound session faster, and the
 // join silently degrades to anonymous guest. Keep this in sync with the capture
 // tool's BOT_USER_AGENT.
-const GOOGLE_SESSION_USER_AGENT =
+export const GOOGLE_SESSION_USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+
+// Minimal Google launch args, kept in sync with the google branch of
+// createBrowserContext(). Used by the keeper's persistent-profile launch.
+const GOOGLE_PERSISTENT_BROWSER_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--window-size=1280,720',
+  '--auto-accept-this-tab-capture',
+  '--autoplay-policy=no-user-gesture-required',
+];
 
 const externalBrowserContexts = new WeakSet<BrowserContext>();
 
@@ -42,14 +53,93 @@ export function isExternalBrowserContext(context?: BrowserContext | null): boole
  */
 export async function persistGoogleSessionState(context: BrowserContext | null | undefined, correlationId: string): Promise<void> {
   const log = getCorrelationIdLog(correlationId);
+
+  // Workers in a keeper+workers deploy must NOT write back: they share one
+  // state.json and concurrent write-back clobbers the keeper's rotated cookies.
+  // Default is on, so the legacy single-instance deploy is unaffected.
+  if (!config.sessionWriteback) {
+    console.log(`${log} session write-back disabled (worker mode) — skipping`);
+    return;
+  }
+
   const statePath = config.googleChromeStorageStatePath;
   if (!statePath || !context || isExternalBrowserContext(context)) return;
 
   try {
-    await context.storageState({ path: statePath });
-    console.log(`${log} Persisted rotated Google session cookies to storage state file`);
+    // Write to a temp file and rename so a worker reading the snapshot never
+    // sees a half-written file (rename is atomic within the same directory).
+    const tmpPath = `${statePath}.tmp-${process.pid}`;
+    await context.storageState({ path: tmpPath });
+    fs.renameSync(tmpPath, statePath);
+    console.log(`${log} Persisted rotated Google session cookies to storage state file (atomic)`);
   } catch (err) {
     console.warn(`${log} Failed to persist Google session storage state (non-fatal)`, err);
+  }
+}
+
+/**
+ * Launch the keeper's persistent Google Chrome profile (GOOGLE_CHROME_USER_DATA_DIR).
+ * A persistent profile keeps Google treating the bot as a trusted device, so the
+ * bound session survives far longer than a re-imported storageState. Single-writer
+ * only: a user-data-dir can be opened by exactly one Chrome at a time.
+ */
+export async function launchGooglePersistentContext(correlationId: string): Promise<BrowserContext> {
+  if (!config.googleChromeUserDataDir) {
+    throw new Error('GOOGLE_CHROME_USER_DATA_DIR is not configured');
+  }
+
+  return launchPersistentContextWithTimeout(
+    async () => await chromium.launchPersistentContext(config.googleChromeUserDataDir!, {
+      headless: false,
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
+      userAgent: GOOGLE_SESSION_USER_AGENT,
+      viewport: { width: 1280, height: 720 },
+      ignoreHTTPSErrors: true,
+      args: GOOGLE_PERSISTENT_BROWSER_ARGS,
+      ignoreDefaultArgs: ['--mute-audio', '--enable-automation'],
+      executablePath: config.chromeExecutablePath,
+    }),
+    60000,
+    correlationId,
+  );
+}
+
+/**
+ * One-time seed: if the persistent profile has no Google cookies yet, import them
+ * from the admin-uploaded snapshot (GOOGLE_CHROME_STORAGE_STATE_PATH) so the
+ * keeper inherits the existing logged-in session instead of needing a fresh
+ * manual login into the profile dir. No-op once the profile is populated.
+ */
+export async function bootstrapGoogleProfileFromSnapshot(correlationId: string): Promise<void> {
+  const log = getCorrelationIdLog(correlationId);
+  const snapshotPath = config.googleChromeStorageStatePath;
+
+  const context = await launchGooglePersistentContext(correlationId);
+  try {
+    const existing = await context.cookies();
+    if (existing.some((c) => c.domain.includes('google.com'))) {
+      console.log(`${log} keeper: persistent profile already has Google cookies — skip bootstrap`);
+      return;
+    }
+    if (!snapshotPath || !fs.existsSync(snapshotPath)) {
+      console.warn(`${log} keeper: empty profile and no snapshot at "${snapshotPath}" — upload a session in admin to seed it`);
+      return;
+    }
+    const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
+    if (!cookies.length) {
+      console.warn(`${log} keeper: snapshot has no cookies (guest session) — nothing to bootstrap`);
+      return;
+    }
+    await context.addCookies(cookies);
+    const page = context.pages()[0] ?? await context.newPage();
+    await page.goto('https://meet.google.com/new?hl=en', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    console.log(`${log} keeper: bootstrapped persistent profile from snapshot (${cookies.length} cookies)`);
+  } finally {
+    // close() flushes the profile (cookies/localStorage) to disk.
+    await context.close().catch(() => {});
   }
 }
 
@@ -251,23 +341,7 @@ async function createBrowserContext(url: string, correlationId: string, botType:
       userDataDir: config.googleChromeUserDataDir,
     });
 
-    const context = await launchPersistentContextWithTimeout(
-      async () => await chromium.launchPersistentContext(config.googleChromeUserDataDir!, {
-        ...contextOptions,
-        headless: false,
-        handleSIGINT: false,
-        handleSIGTERM: false,
-        handleSIGHUP: false,
-        args: [
-          ...browserArgs,
-          ...displayArgs,
-        ],
-        ignoreDefaultArgs,
-        executablePath: config.chromeExecutablePath,
-      }),
-      60000,
-      correlationId
-    );
+    const context = await launchGooglePersistentContext(correlationId);
 
     const page = context.pages()[0] ?? await context.newPage();
     attachBrowserErrorHandlers(context.browser(), context, page, correlationId);
