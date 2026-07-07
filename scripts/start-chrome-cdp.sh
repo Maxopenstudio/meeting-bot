@@ -59,7 +59,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Optional UA override. For Google-session logins this MUST match the UA the
+# bot replays (GOOGLE_SESSION_USER_AGENT in src/lib/chromium.ts) — Google binds
+# the session to the login device; a UA mismatch between login and replay makes
+# it invalidate the session faster.
+extra_args=()
+if [ -n "${CHROME_USER_AGENT:-}" ]; then
+  extra_args+=(--user-agent="$CHROME_USER_AGENT")
+fi
+
 google-chrome-stable \
+  "${extra_args[@]}" \
   --remote-debugging-address="$CHROME_REMOTE_DEBUGGING_ADDRESS" \
   --remote-debugging-port="$CHROME_REMOTE_DEBUGGING_PORT" \
   --remote-allow-origins='*' \
