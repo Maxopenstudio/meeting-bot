@@ -16,7 +16,10 @@ if command -v pulseaudio >/dev/null 2>&1; then
   pulseaudio --start --exit-idle-time=-1 || true
 fi
 
-Xvfb "$DISPLAY" -screen 0 "${CHROME_WINDOW_SIZE}x24" -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
+# CHROME_WINDOW_SIZE is comma-separated for chrome's --window-size; Xvfb wants
+# WxH ("1920,1080" → "1920x1080").
+xvfb_geometry="${CHROME_WINDOW_SIZE/,/x}"
+Xvfb "$DISPLAY" -screen 0 "${xvfb_geometry}x24" -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
 xvfb_pid="$!"
 
 # Chrome races Xvfb startup and dies with "Missing X server" if launched before
