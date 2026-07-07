@@ -19,6 +19,19 @@ fi
 Xvfb "$DISPLAY" -screen 0 "${CHROME_WINDOW_SIZE}x24" -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
 xvfb_pid="$!"
 
+# Chrome races Xvfb startup and dies with "Missing X server" if launched before
+# the display socket exists — wait for it (up to 5s).
+x_socket="/tmp/.X11-unix/X${DISPLAY#:}"
+for _ in $(seq 1 50); do
+  [ -S "$x_socket" ] && break
+  sleep 0.1
+done
+if [ ! -S "$x_socket" ]; then
+  echo "Xvfb failed to create $x_socket:" >&2
+  cat /tmp/xvfb.log >&2 || true
+  exit 1
+fi
+
 cat >/tmp/chrome-cdp-nginx.conf <<EOF
 pid /tmp/nginx.pid;
 error_log /dev/stderr warn;
