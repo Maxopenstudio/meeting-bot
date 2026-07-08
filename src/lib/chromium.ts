@@ -112,31 +112,49 @@ export async function launchGooglePersistentContext(correlationId: string): Prom
  * keeper inherits the existing logged-in session instead of needing a fresh
  * manual login into the profile dir. No-op once the profile is populated.
  */
-export async function bootstrapGoogleProfileFromSnapshot(correlationId: string): Promise<void> {
+export async function bootstrapGoogleProfileFromSnapshot(
+  correlationId: string,
+  opts: { force?: boolean } = {},
+): Promise<boolean> {
   const log = getCorrelationIdLog(correlationId);
   const snapshotPath = config.googleChromeStorageStatePath;
 
   const context = await launchGooglePersistentContext(correlationId);
   try {
     const existing = await context.cookies();
-    if (existing.some((c) => c.domain.includes('google.com'))) {
+    const hasGoogle = existing.some((c) => c.domain.includes('google.com'));
+    // A populated profile is normally left untouched. But a signed-OUT profile
+    // still has google.com cookies, so the plain "has cookies → skip" guard
+    // would make a dead profile a permanent dead-end and silently ignore every
+    // fresh state.json uploaded in admin. opts.force (used by the keeper when a
+    // cycle reports signedIn=false and a NEWER snapshot exists) clears the stale
+    // cookies and re-seeds from the snapshot so the upload actually takes effect.
+    if (hasGoogle && !opts.force) {
       console.log(`${log} keeper: persistent profile already has Google cookies — skip bootstrap`);
-      return;
+      return false;
     }
     if (!snapshotPath || !fs.existsSync(snapshotPath)) {
       console.warn(`${log} keeper: empty profile and no snapshot at "${snapshotPath}" — upload a session in admin to seed it`);
-      return;
+      return false;
     }
     const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
     const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
     if (!cookies.length) {
       console.warn(`${log} keeper: snapshot has no cookies (guest session) — nothing to bootstrap`);
-      return;
+      return false;
+    }
+    if (hasGoogle && opts.force) {
+      // Drop the stale signed-out cookies before re-seeding; addCookies merges
+      // by (name, domain, path), but rotated values (e.g. PSIDTS) must not be
+      // left to coexist with the snapshot's.
+      await context.clearCookies();
+      console.log(`${log} keeper: signed-out profile — cleared stale cookies before re-seed`);
     }
     await context.addCookies(cookies);
     const page = context.pages()[0] ?? await context.newPage();
     await page.goto('https://meet.google.com/new?hl=en', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    console.log(`${log} keeper: bootstrapped persistent profile from snapshot (${cookies.length} cookies)`);
+    console.log(`${log} keeper: ${opts.force ? 're-seeded' : 'bootstrapped'} persistent profile from snapshot (${cookies.length} cookies)`);
+    return true;
   } finally {
     // close() flushes the profile (cookies/localStorage) to disk.
     await context.close().catch(() => {});
