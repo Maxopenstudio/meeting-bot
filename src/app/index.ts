@@ -13,6 +13,15 @@ const app = express();
 
 app.use(express.json());
 
+// Bearer auth for the whole API when BOT_API_TOKEN is set. /health stays open
+// (Docker HEALTHCHECK has no token); /metrics stays open for scrapers.
+const OPEN_PATHS = new Set(['/health', '/metrics']);
+app.use((req, res, next) => {
+  if (!config.apiToken || OPEN_PATHS.has(req.path)) return next();
+  if (req.headers.authorization === `Bearer ${config.apiToken}`) return next();
+  return res.status(401).json({ success: false, error: 'unauthorized' });
+});
+
 // Initialize Redis consumer service
 export const redisConsumerService = new RedisConsumerService();
 

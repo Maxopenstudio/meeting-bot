@@ -57,6 +57,10 @@ const parseOptionalNumber = (value?: string) => {
 
 export default {
   port: process.env.PORT || 3000,
+  // Optional bearer token guarding the HTTP API (join/leave/session-health).
+  // Unset = no auth (legacy: bot reachable only inside the docker network).
+  // REQUIRED when the bot node is exposed to the internet (multi-server fleet).
+  apiToken: process.env.BOT_API_TOKEN,
   db: {
     host: process.env.DB_HOST || 'localhost',
     user: process,
