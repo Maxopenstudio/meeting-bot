@@ -50,7 +50,30 @@ export class VoiceListener {
       this.opts.log('[voice] SONIOX_API_KEY not set — wake-word listener disabled');
       return;
     }
-    this.connect();
+    // Load the STT biasing dictionary (user's project names etc.) first — it
+    // teaches Soniox the rare proper nouns («МедСкин», project names) it would
+    // otherwise mangle. Non-fatal: connect anyway if the fetch fails.
+    void this.fetchSttContext().finally(() => this.connect());
+  }
+
+  /** Domain terms for Soniox `context` biasing, fetched from TalkBase. */
+  private sttContext = '';
+
+  private async fetchSttContext(): Promise<void> {
+    const base = config.talkbaseApiBase;
+    const key = config.internalApiKey;
+    if (!base || !key) return;
+    try {
+      const res = await axios.post(
+        `${base}/api/bot/voice/context`,
+        { session_id: this.opts.sessionId },
+        { headers: { 'X-Internal-API-Key': key }, timeout: 8000 },
+      );
+      this.sttContext = String(res.data?.context ?? '');
+      if (this.sttContext) this.opts.log('[voice] STT context loaded', { chars: this.sttContext.length });
+    } catch (e: any) {
+      this.opts.log('[voice] STT context fetch failed', { error: e?.message });
+    }
   }
 
   stop(): void {
@@ -89,6 +112,7 @@ export class VoiceListener {
         language_hints: ['ru', 'uk', 'en'],
         enable_endpoint_detection: true,
         enable_language_identification: true,
+        ...(this.sttContext ? { context: this.sttContext } : {}),
       }));
 
       // parec captures the meeting audio (monitor of the default sink) as PCM.
