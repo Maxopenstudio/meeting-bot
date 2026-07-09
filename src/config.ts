@@ -127,8 +127,14 @@ export default {
   // is captured from this PulseAudio monitor (the default output sink).
   sonioxApiKey: process.env.SONIOX_API_KEY,
   meetingAudioSource: process.env.MEETING_AUDIO_SOURCE ?? 'virtual_output.monitor',
-  // Wake phrases that summon the bot (lowercased, matched fuzzily at start).
+  // Wake phrases that summon the bot (lowercased, matched anywhere in the utterance).
   wakeWords: (process.env.BOT_WAKE_WORDS ?? 'толкбейз,talkbase,толк бейз,talk base').split(','),
+  // Slang nicknames that ALSO summon the bot, but only in address position (the
+  // start of an utterance) — words like «братан» fly around between people all
+  // the time, and the bot must not butt in on someone else's conversation.
+  // «глек» = how Soniox tends to hear «Глэк».
+  nicknameWakeWords: (process.env.BOT_NICKNAME_WAKE_WORDS
+    ?? 'кентуха,братан,глэк,глек,голова оранжевая,оранжевая голова').split(','),
   // Notification: Redis. Explicitly enabled via NOTIFY_REDIS_ENABLED, and enabled
   // automatically for Redis-worker mode so completed jobs are written to result list.
   notifyRedisEnabled: process.env.NOTIFY_REDIS_ENABLED === 'true' || process.env.REDIS_CONSUMER_ENABLED === 'true',
