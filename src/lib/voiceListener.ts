@@ -159,15 +159,52 @@ export class VoiceListener {
     const key = config.internalApiKey;
     if (!base || !key) return;
     try {
+      // Phase 1: fast classify-or-answer. Backend either answers directly
+      // (smalltalk/general) or tells us the question needs a data lookup.
       const res = await axios.post(
         `${base}/api/bot/voice/respond`,
-        { utterance: question, language: lang, project_id: this.opts.projectId },
+        { utterance: question, language: lang, session_id: this.opts.sessionId },
         { headers: { 'X-Internal-API-Key': key }, timeout: 20000 },
       );
+      const mode = res.data?.mode;
       const text = res.data?.text;
+
+      if (mode === 'search') {
+        // Speak the "минуточку" filler right away (cached TTS), then run the
+        // slow RAG lookup and speak the real answer.
+        if (text) await this.answerWith(text, lang, true);
+        await this.askRag(question, lang);
+        return;
+      }
+
       if (text) await this.answerWith(text, lang, false);
     } catch (e: any) {
       this.opts.log('[voice] respond failed', { error: e?.message });
+    }
+  }
+
+  /**
+   * The complex-question path: TalkBase resolves our session → user + project,
+   * runs RAG, and returns a short spoken answer. Longer timeout because the
+   * pipeline does vector search + generation.
+   */
+  private async askRag(question: string, lang: string): Promise<void> {
+    const base = config.talkbaseApiBase;
+    const key = config.internalApiKey;
+    if (!base || !key) return;
+    try {
+      const res = await axios.post(
+        `${base}/api/bot/voice/ask`,
+        { utterance: question, language: lang, session_id: this.opts.sessionId },
+        { headers: { 'X-Internal-API-Key': key }, timeout: 60000 },
+      );
+      const text = res.data?.text;
+      if (text) {
+        this.opts.log('[voice] rag answer', { project: res.data?.project, chars: text.length });
+        await this.answerWith(text, lang, false);
+      }
+    } catch (e: any) {
+      this.opts.log('[voice] ask failed', { error: e?.message });
     }
   }
 
