@@ -287,6 +287,9 @@ export class VoiceListener {
       }
     } catch (e: any) {
       this.opts.log('[voice] ask failed', { error: e?.message });
+      // Don't leave the user hanging after the "минуточку" filler — admit the
+      // lookup failed so they know to re-ask instead of waiting in silence.
+      void speak(this.searchFailed(lang), { cacheable: true });
     } finally {
       clearInterval(reassure);
     }
@@ -296,6 +299,16 @@ export class VoiceListener {
   private stillLooking(lang: string): string {
     const phrases: Record<string, string> = { ru: 'Ещё секунду.', uk: 'Ще секунду.', en: 'One moment.' };
     return phrases[lang] ?? 'Ещё секунду.';
+  }
+
+  /** Spoken apology when the RAG lookup errors out (cached TTS). */
+  private searchFailed(lang: string): string {
+    const phrases: Record<string, string> = {
+      ru: 'Хм, не получилось достать ответ. Попробуй спросить ещё раз.',
+      uk: 'Хм, не вийшло дістати відповідь. Спробуй запитати ще раз.',
+      en: 'Hmm, I could not fetch that. Please ask again.',
+    };
+    return phrases[lang] ?? phrases.ru;
   }
 
   private async answerWith(text: string, lang: string, cacheable: boolean): Promise<void> {
