@@ -22,6 +22,11 @@ export class VoiceListener {
   private speaking = false;
   private utterance = '';
   private lastLang: string | null = null;
+  // Soniox often finalizes "Эй толкбейз" and the actual question as SEPARATE
+  // utterances. After a bare wake word we open a short window during which the
+  // next utterance is taken as the question (no wake word needed).
+  private awaitingUntil = 0;
+  private static readonly FOLLOWUP_WINDOW_MS = 12000;
 
   constructor(
     private readonly opts: {
@@ -116,22 +121,37 @@ export class VoiceListener {
     this.utterance = '';
     if (!utter) return;
 
+    const now = this.nowMs();
     const lower = utter.toLowerCase();
     const hit = config.wakeWords.map((w) => w.trim().toLowerCase()).find((w) => w && lower.includes(w));
-    if (!hit) return;
-
-    // Take the text AFTER the wake phrase as the question.
-    const idx = lower.indexOf(hit);
-    const question = utter.slice(idx + hit.length).replace(/^[\s,.:!?—-]+/, '').trim();
     const lang = this.normalizeLang(this.lastLang);
 
-    this.opts.log('[voice] wake word detected', { question, lang });
-    if (!question) {
-      // Just the name, no question — acknowledge.
-      void this.answerWith('Да, слушаю.', lang, true);
+    if (hit) {
+      // Take the text AFTER the wake phrase as the question.
+      const idx = lower.indexOf(hit);
+      const question = utter.slice(idx + hit.length).replace(/^[\s,.:!?—-]+/, '').trim();
+      this.opts.log('[voice] wake word detected', { question, lang });
+      if (question) {
+        this.awaitingUntil = 0;
+        void this.handleQuestion(question, lang);
+      } else {
+        // Bare wake word — the question likely comes in the NEXT utterance.
+        this.awaitingUntil = now + VoiceListener.FOLLOWUP_WINDOW_MS;
+      }
       return;
     }
-    void this.handleQuestion(question, lang);
+
+    // No wake word, but we're within the follow-up window → this utterance IS
+    // the question the user asked right after saying the bot's name.
+    if (this.awaitingUntil > now) {
+      this.awaitingUntil = 0;
+      this.opts.log('[voice] follow-up question', { question: utter, lang });
+      void this.handleQuestion(utter, lang);
+    }
+  }
+
+  private nowMs(): number {
+    return Date.now();
   }
 
   private async handleQuestion(question: string, lang: string): Promise<void> {
