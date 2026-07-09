@@ -259,10 +259,12 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     `--window-size=${size.width},${size.height}`,
     '--auto-accept-this-tab-capture',
     '--autoplay-policy=no-user-gesture-required',
-    // Voice mode: auto-accept getUserMedia (mic) so Meet joins with the botmic
-    // device without a permission prompt. Uses the real PulseAudio default
-    // source (botmic.monitor) — NOT a fake device — so audio actually flows.
-    ...(voiceEnabled ? ['--use-fake-ui-for-media-stream'] : []),
+    // NOTE: do NOT add --use-fake-ui-for-media-stream for voice mode — it
+    // collides with --auto-accept-this-tab-capture and crashes the renderer the
+    // moment recording's getDisplayMedia fires (prod 2026-07-09: browser closed
+    // right after "Begin recording"). Mic permission is granted via Playwright
+    // grantPermissions(['microphone']) instead; the botmic_src default source
+    // supplies the audio.
   ];
 
   const recordingBrowserArgs: string[] = [
