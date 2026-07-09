@@ -52,14 +52,17 @@ if wait_for_pulseaudio && pgrep -x "pulseaudio" > /dev/null; then
     pactl set-default-sink virtual_output 2>&1
     echo "✓ Set virtual_output as default sink"
 
-    # Virtual MICROPHONE for the interactive voice bot: a null-sink whose
-    # .monitor Chrome uses as mic input (voice mode). We pacat TTS audio into
-    # it so participants hear the bot speak. Harmless when unused.
+    # Virtual MICROPHONE for the interactive voice bot. We pacat TTS audio into
+    # a null-sink; Chrome must read it as a real mic. Chrome/WebRTC does NOT
+    # enumerate a raw sink .monitor as a microphone ("Microphone not found"), so
+    # we remap the monitor into a proper capture SOURCE and default to that.
     BOT_MIC_SINK="${BOT_MIC_SINK:-botmic}"
-    MIC_ID=$(pactl load-module module-null-sink sink_name="${BOT_MIC_SINK}" sink_properties=device.description="BotMic" 2>&1)
+    MIC_ID=$(pactl load-module module-null-sink sink_name="${BOT_MIC_SINK}" sink_properties=device.description="BotMicSink" 2>&1)
     echo "✓ Loaded bot mic null sink '${BOT_MIC_SINK}' (ID: ${MIC_ID})"
-    pactl set-default-source "${BOT_MIC_SINK}.monitor" 2>&1
-    echo "✓ Set ${BOT_MIC_SINK}.monitor as default source (bot microphone)"
+    REMAP_ID=$(pactl load-module module-remap-source master="${BOT_MIC_SINK}.monitor" source_name=botmic_src source_properties=device.description="BotMic" 2>&1)
+    echo "✓ Loaded remap source 'botmic_src' from ${BOT_MIC_SINK}.monitor (ID: ${REMAP_ID})"
+    pactl set-default-source botmic_src 2>&1
+    echo "✓ Set botmic_src as default source (bot microphone)"
 
     # Verify monitor source exists for ffmpeg
     if pactl list sources short | grep -q "virtual_output.monitor"; then
