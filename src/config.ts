@@ -123,6 +123,12 @@ export default {
   // Name of the PulseAudio null-sink that acts as the bot's virtual microphone
   // (Chrome uses its .monitor as mic input; we paplay TTS into the sink).
   botMicSink: process.env.BOT_MIC_SINK ?? 'botmic',
+  // Soniox realtime STT for the voice agent's wake-word listener. Meeting audio
+  // is captured from this PulseAudio monitor (the default output sink).
+  sonioxApiKey: process.env.SONIOX_API_KEY,
+  meetingAudioSource: process.env.MEETING_AUDIO_SOURCE ?? 'virtual_output.monitor',
+  // Wake phrases that summon the bot (lowercased, matched fuzzily at start).
+  wakeWords: (process.env.BOT_WAKE_WORDS ?? 'толкбейз,talkbase,толк бейз,talk base').split(','),
   // Notification: Redis. Explicitly enabled via NOTIFY_REDIS_ENABLED, and enabled
   // automatically for Redis-worker mode so completed jobs are written to result list.
   notifyRedisEnabled: process.env.NOTIFY_REDIS_ENABLED === 'true' || process.env.REDIS_CONSUMER_ENABLED === 'true',

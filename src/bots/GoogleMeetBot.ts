@@ -22,6 +22,8 @@ export class GoogleMeetBot extends MeetBotBase {
   // True when the pre-join screen had no name input, i.e. the Google session
   // from state.json was accepted and we joined signed in (avatar account).
   private _joinedWithSignedInSession = false;
+  // Voice agent wake-word listener (Phase 2), active only in voice mode.
+  private _voiceListener: import('../lib/voiceListener').VoiceListener | null = null;
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -68,6 +70,10 @@ export class GoogleMeetBot extends MeetBotBase {
 
       throw error;
     } finally {
+      // Stop the voice listener regardless of exit path (Soniox WS + parec).
+      try { this._voiceListener?.stop(); } catch { /* noop */ }
+      this._voiceListener = null;
+
       // Persist the latest cookie rotation from the whole meeting before the
       // browser goes away (Google may rotate again mid-meeting).
       if (this._joinedWithSignedInSession) {
@@ -755,9 +761,29 @@ export class GoogleMeetBot extends MeetBotBase {
       this._logger.info('Error checking/dismissing device notifications...', { error });
     }
 
+    // Voice mode: start the wake-word listener alongside recording. It streams
+    // the meeting audio to Soniox and answers when addressed ("Эй, толкбейз…").
+    if (voiceEnabled) {
+      try {
+        const { VoiceListener } = await import('../lib/voiceListener');
+        this._voiceListener = new VoiceListener({
+          sessionId: botId ?? eventId ?? this.slightlySecretId,
+          correlationId: this._correlationId,
+          log: (m, meta) => this._logger.info(m, meta ?? {}),
+        });
+        this._voiceListener.start();
+        this._logger.info('Voice mode — wake-word listener started');
+      } catch (e) {
+        this._logger.warn('Voice listener failed to start (continuing to record)', { error: (e as Error).message });
+      }
+    }
+
     // Recording the meeting page
     this._logger.info('Begin recording...');
     await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader });
+
+    this._voiceListener?.stop();
+    this._voiceListener = null;
 
     pushState('finished');
   }
