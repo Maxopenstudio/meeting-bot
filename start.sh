@@ -51,6 +51,16 @@ if wait_for_pulseaudio && pgrep -x "pulseaudio" > /dev/null; then
     pactl set-default-sink virtual_output 2>&1
     echo "✓ Set virtual_output as default sink"
 
+    # Virtual MICROPHONE for the interactive voice bot: a null-sink whose
+    # .monitor Chrome uses as mic input. We paplay/pacat TTS audio into it so
+    # participants hear the bot speak. Only used in voice mode; harmless otherwise.
+    BOT_MIC_SINK="${BOT_MIC_SINK:-botmic}"
+    MIC_ID=$(pactl load-module module-null-sink sink_name="${BOT_MIC_SINK}" sink_properties=device.description="BotMic" 2>&1)
+    echo "✓ Loaded bot mic null sink '${BOT_MIC_SINK}' (ID: ${MIC_ID})"
+    # Make its monitor the default SOURCE so Chrome getUserMedia picks it as mic.
+    pactl set-default-source "${BOT_MIC_SINK}.monitor" 2>&1
+    echo "✓ Set ${BOT_MIC_SINK}.monitor as default source (bot microphone)"
+
     # List available sinks and sources
     echo "=== Available PulseAudio sinks ==="
     pactl list sinks short

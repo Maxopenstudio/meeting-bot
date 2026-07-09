@@ -29,7 +29,7 @@ export class GoogleMeetBot extends MeetBotBase {
     this._correlationId = correlationId;
   }
 
-  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader }: JoinParams): Promise<void> {
+  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, voiceMode }: JoinParams): Promise<void> {
     const _state: BotStatus[] = ['processing'];
 
     const handleUpload = async () => {
@@ -41,7 +41,7 @@ export class GoogleMeetBot extends MeetBotBase {
 
     try {
       const pushState = (st: BotStatus) => _state.push(st);
-      await this.joinMeeting({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, pushState });
+      await this.joinMeeting({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, voiceMode, pushState });
 
       // Finish the upload from the temp video
       const uploadResult = await handleUpload();
@@ -114,10 +114,20 @@ export class GoogleMeetBot extends MeetBotBase {
     }
   }
 
-  private async joinMeeting({ url, name, teamId, userId, eventId, botId, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
+  private async joinMeeting({ url, name, teamId, userId, eventId, botId, voiceMode, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
+    const voiceEnabled = voiceMode === 'reactive' || voiceMode === 'pm';
     this._logger.info('Launching browser...');
 
-    this.page = await createBrowserContext(url, this._correlationId, 'google');
+    this.page = await createBrowserContext(url, this._correlationId, 'google', voiceEnabled);
+
+    // Voice mode: grant the mic up-front so Meet's getUserMedia gets the botmic
+    // device without a permission dialog (mic input = botmic.monitor, silent
+    // until the bot plays TTS into the sink).
+    if (voiceEnabled) {
+      await this.page.context().grantPermissions(['microphone'], { origin: 'https://meet.google.com' }).catch((e) =>
+        this._logger.warn('Voice mode: grantPermissions(microphone) failed (continuing)', { error: (e as Error).message }),
+      );
+    }
 
     const meetUrl = this.withEnglishLocale(url);
     this._logger.info('Navigating to Google Meet URL...', { meetUrl });
@@ -125,6 +135,12 @@ export class GoogleMeetBot extends MeetBotBase {
 
     const nameInputSelector = 'input[type="text"]';
     const clickContinueWithoutDevicesIfPresent = async (timeout = 5000) => {
+      // Voice mode: the bot MUST join with a microphone (the botmic virtual
+      // device) so it can speak. Don't dismiss the mic — let Meet join with it.
+      if (voiceEnabled) {
+        this._logger.info('Voice mode — keeping microphone (skip "continue without devices")');
+        return false;
+      }
       const continueWithoutDevicesButton = this.page
         .locator('button')
         .filter({ hasText: /Continue without microphone and camera|Ohne Mikrofon und Kamera fortfahren/i })

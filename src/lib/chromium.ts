@@ -247,7 +247,7 @@ async function launchPersistentContextWithTimeout(launchFn: () => Promise<Browse
   });
 }
 
-async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google'): Promise<Page> {
+async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google', voiceEnabled = false): Promise<Page> {
   const size = { width: 1280, height: 720 };
 
   // Google Meet is sensitive to browser fingerprinting before admission. Keep
@@ -259,6 +259,10 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     `--window-size=${size.width},${size.height}`,
     '--auto-accept-this-tab-capture',
     '--autoplay-policy=no-user-gesture-required',
+    // Voice mode: auto-accept getUserMedia (mic) so Meet joins with the botmic
+    // device without a permission prompt. Uses the real PulseAudio default
+    // source (botmic.monitor) — NOT a fake device — so audio actually flows.
+    ...(voiceEnabled ? ['--use-fake-ui-for-media-stream'] : []),
   ];
 
   const recordingBrowserArgs: string[] = [

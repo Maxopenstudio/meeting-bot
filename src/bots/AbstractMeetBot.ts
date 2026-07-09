@@ -22,6 +22,9 @@ export interface JoinParams {
   botId?: string;
   eventId?: string;
   uploader: IUploader;
+  // Interactive voice bot: off = silent recorder (join mic-off, current default);
+  // reactive/pm = join WITH the virtual mic so the bot can speak.
+  voiceMode?: 'off' | 'reactive' | 'pm';
 }
 
 export abstract class AbstractMeetBot {

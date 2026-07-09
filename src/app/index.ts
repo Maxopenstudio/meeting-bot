@@ -43,6 +43,21 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// Voice agent test hook (Phase 1): make the bot speak a phrase into the meeting.
+// POST /say { text, voice? } — fetches TTS from TalkBase and plays it into the
+// virtual mic. Requires the bot to have joined in voice mode (mic enabled).
+app.post('/say', async (req, res) => {
+  try {
+    const { speak } = await import('../lib/speak');
+    const text = (req.body?.text || '').toString();
+    if (!text.trim()) return res.status(400).json({ success: false, error: 'text required' });
+    const ok = await speak(text, { voice: req.body?.voice, cacheable: !!req.body?.cacheable });
+    return res.status(ok ? 200 : 502).json({ success: ok });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
+});
+
 // Liveness probe for the Google session (state.json). Launches a browser and
 // navigates to Meet to see whether the restored session is still signed in —
 // the backend polls this on a schedule and alerts (Telegram) when it goes dead,

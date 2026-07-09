@@ -13,6 +13,7 @@ export interface MeetingJoinParams {
   timezone: string;
   botId?: string;
   eventId?: string;
+  voiceMode?: 'off' | 'reactive' | 'pm';
 }
 
 export interface MeetingJoinRedisParams extends MeetingJoinParams {

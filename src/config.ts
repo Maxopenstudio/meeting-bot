@@ -114,6 +114,15 @@ export default {
   notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL,
   // Optional secret to sign payloads (HMAC-SHA256). If set, signature will be sent in X-Webhook-Signature header
   notifyWebhookSecret: process.env.NOTIFY_WEBHOOK_SECRET,
+  // Voice agent (interactive bot). Base URL of the TalkBase API + internal key
+  // to fetch TTS audio (/api/bot/voice/tts). Base derives from the notify
+  // webhook URL when not set explicitly.
+  talkbaseApiBase: process.env.TALKBASE_API_BASE
+    || (process.env.NOTIFY_WEBHOOK_URL ? process.env.NOTIFY_WEBHOOK_URL.replace(/\/api\/bot\/notify\/?$/, '') : ''),
+  internalApiKey: process.env.INTERNAL_API_KEY,
+  // Name of the PulseAudio null-sink that acts as the bot's virtual microphone
+  // (Chrome uses its .monitor as mic input; we paplay TTS into the sink).
+  botMicSink: process.env.BOT_MIC_SINK ?? 'botmic',
   // Notification: Redis. Explicitly enabled via NOTIFY_REDIS_ENABLED, and enabled
   // automatically for Redis-worker mode so completed jobs are written to result list.
   notifyRedisEnabled: process.env.NOTIFY_REDIS_ENABLED === 'true' || process.env.REDIS_CONSUMER_ENABLED === 'true',
