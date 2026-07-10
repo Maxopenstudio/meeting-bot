@@ -280,10 +280,11 @@ export class VoiceListener {
     if (this.pmSilence) { clearTimeout(this.pmSilence); this.pmSilence = null; }
 
     try {
+      // 90s: an utterance step may run an embedded RAG lookup server-side.
       const res = await axios.post(
         `${base}/api/bot/voice/pm/next`,
         { session_id: this.opts.sessionId, ...payload },
-        { headers: { 'X-Internal-API-Key': key }, timeout: 60000 },
+        { headers: { 'X-Internal-API-Key': key }, timeout: 90000 },
       );
       const action = res.data?.action;
       const text = res.data?.text;
@@ -351,7 +352,12 @@ export class VoiceListener {
         const question = utter.slice(idx + hit.length).replace(/^[\s,.:!?—-]+/, '').trim();
         if (question) {
           this.opts.log('[voice] wake word detected (during PM)', { question, lang });
-          void this.handleQuestion(question, lang);
+          // Pause the "participant is silent" timer while we answer — a slow
+          // RAG answer must not skip the participant mid-question.
+          if (this.pmSilence) { clearTimeout(this.pmSilence); this.pmSilence = null; }
+          void this.handleQuestion(question, lang).then(() => {
+            if (this.pmActive && this.pmStandupStarted) this.armPmSilence();
+          });
           return;
         }
         // Bare wake word before the standup opened — treat as "start the
