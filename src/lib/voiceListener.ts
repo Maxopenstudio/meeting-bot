@@ -45,12 +45,15 @@ export class VoiceListener {
       mode?: 'reactive' | 'pm';
       /** PM mode: reads the current Meet roster (display names) from the page. */
       getParticipants?: () => Promise<string[]>;
+      /** The bot's own Meet display name — excluded from the roster. */
+      selfName?: string;
       log: (msg: string, meta?: any) => void;
     },
   ) {}
 
   // ---- PM (scenario) mode state --------------------------------------------
   private pmActive = false;   // scenario in progress (utterances feed /pm/next)
+  private pmStandupStarted = false; // joined sent with a real (non-empty) roster
   private pmSilence: NodeJS.Timeout | null = null;
   private static readonly PM_ANSWER_TIMEOUT_MS = 60000;
   // Standup answers have long thinking pauses — wait longer than reactive Q&A.
@@ -210,25 +213,63 @@ export class VoiceListener {
    * and report silence when a participant doesn't answer.
    */
   private async startPm(): Promise<void> {
+    this.pmActive = true;
     const participants = await this.waitForRoster();
     this.opts.log('[voice] PM mode — roster', { participants });
-    this.pmActive = true;
-    await this.pmEvent({ event: 'joined', participants });
+
+    if (participants.length > 0) {
+      this.pmStandupStarted = true;
+      await this.pmEvent({ event: 'joined', participants });
+      return;
+    }
+
+    // Nobody (except us) in the call yet. Announce we're waiting, then keep
+    // polling the roster and open the standup as soon as people arrive.
+    await this.pmEvent({ event: 'joined', participants: [] });
+    void this.pmRetryUntilRoster();
+  }
+
+  /** Background loop: re-read the roster every 20s until someone shows up. */
+  private async pmRetryUntilRoster(): Promise<void> {
+    while (!this.stopped && this.pmActive && !this.pmStandupStarted) {
+      await new Promise((r) => setTimeout(r, 20000));
+      if (this.stopped || !this.pmActive || this.pmStandupStarted) return;
+      const participants = await this.readRosterFiltered();
+      if (participants.length > 0) {
+        this.opts.log('[voice] PM mode — participants arrived', { participants });
+        this.pmStandupStarted = true;
+        await this.pmEvent({ event: 'joined', participants });
+        return;
+      }
+    }
   }
 
   /** Poll the page for participant names for up to 60s (people trickle in). */
   private async waitForRoster(): Promise<string[]> {
     for (let attempt = 0; attempt < 12; attempt++) {
       if (this.stopped) return [];
-      try {
-        const names = (await this.opts.getParticipants?.()) ?? [];
-        if (names.length > 0) return names;
-      } catch (e: any) {
-        this.opts.log('[voice] PM roster read failed', { error: e?.message });
-      }
+      const names = await this.readRosterFiltered();
+      if (names.length > 0) return names;
       await new Promise((r) => setTimeout(r, 5000));
     }
     return [];
+  }
+
+  /** Roster minus the bot itself (its own tile is always visible to it). */
+  private async readRosterFiltered(): Promise<string[]> {
+    try {
+      const names = (await this.opts.getParticipants?.()) ?? [];
+      const self = (this.opts.selfName ?? '').toLowerCase();
+      return names.filter((n) => {
+        const l = n.toLowerCase();
+        if (l.includes('talkbase') || l.includes('notetaker')) return false;
+        if (self && (l.includes(self) || self.includes(l))) return false;
+        return true;
+      });
+    } catch (e: any) {
+      this.opts.log('[voice] PM roster read failed', { error: e?.message });
+      return [];
+    }
   }
 
   /** One round-trip to the scenario engine; executes the returned step. */
@@ -312,6 +353,18 @@ export class VoiceListener {
           this.opts.log('[voice] wake word detected (during PM)', { question, lang });
           void this.handleQuestion(question, lang);
           return;
+        }
+        // Bare wake word before the standup opened — treat as "start the
+        // standup now": re-read the roster and open the scenario.
+        if (!this.pmStandupStarted) {
+          void this.readRosterFiltered().then((participants) => {
+            if (participants.length > 0) {
+              this.pmStandupStarted = true;
+              void this.pmEvent({ event: 'joined', participants });
+            } else {
+              void speak(this.ackPhrase(lang), { cacheable: true });
+            }
+          });
         }
         return;
       }

@@ -771,6 +771,7 @@ export class GoogleMeetBot extends MeetBotBase {
           correlationId: this._correlationId,
           mode: voiceMode === 'pm' ? 'pm' : 'reactive',
           getParticipants: () => this.readMeetRoster(),
+          selfName: name,
           log: (m, meta) => this._logger.info(m, meta ?? {}),
         });
         this._voiceListener.start();
