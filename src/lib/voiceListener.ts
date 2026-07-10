@@ -41,9 +41,20 @@ export class VoiceListener {
       projectId?: string;
       correlationId: string;
       sampleRate?: number;
+      /** 'reactive' (default) = wake-word Q&A only; 'pm' = run the server-driven scenario. */
+      mode?: 'reactive' | 'pm';
+      /** PM mode: reads the current Meet roster (display names) from the page. */
+      getParticipants?: () => Promise<string[]>;
       log: (msg: string, meta?: any) => void;
     },
   ) {}
+
+  // ---- PM (scenario) mode state --------------------------------------------
+  private pmActive = false;   // scenario in progress (utterances feed /pm/next)
+  private pmSilence: NodeJS.Timeout | null = null;
+  private static readonly PM_ANSWER_TIMEOUT_MS = 60000;
+  // Standup answers have long thinking pauses — wait longer than reactive Q&A.
+  private static readonly PM_TURN_PAUSE_MS = 2500;
 
   start(): void {
     if (!config.sonioxApiKey) {
@@ -54,6 +65,10 @@ export class VoiceListener {
     // teaches Soniox the rare proper nouns («МедСкин», project names) it would
     // otherwise mangle. Non-fatal: connect anyway if the fetch fails.
     void this.fetchSttContext().finally(() => this.connect());
+
+    if (this.opts.mode === 'pm') {
+      void this.startPm();
+    }
   }
 
   /** Domain terms for Soniox `context` biasing, fetched from TalkBase. */
@@ -78,6 +93,8 @@ export class VoiceListener {
 
   stop(): void {
     this.stopped = true;
+    this.pmActive = false;
+    if (this.pmSilence) { clearTimeout(this.pmSilence); this.pmSilence = null; }
     if (this.tokenWatchdog) { clearTimeout(this.tokenWatchdog); this.tokenWatchdog = null; }
     if (this.finalizeTimer) { clearTimeout(this.finalizeTimer); this.finalizeTimer = null; }
     try { this.ws?.close(); } catch { /* noop */ }
@@ -165,16 +182,97 @@ export class VoiceListener {
         clearTimeout(this.finalizeTimer);
         this.finalizeTimer = null;
       }
+      // Someone IS talking — don't fire the PM "participant is silent" timer
+      // mid-answer; it re-arms after the utterance reaches the engine.
+      if (this.pmActive && this.pmSilence) {
+        clearTimeout(this.pmSilence);
+        this.pmSilence = null;
+      }
       if (token.is_final) this.utterance += text;
     }
   }
 
   private scheduleFinalize(): void {
     if (this.finalizeTimer) clearTimeout(this.finalizeTimer);
+    const pause = this.pmActive ? VoiceListener.PM_TURN_PAUSE_MS : VoiceListener.TURN_PAUSE_MS;
     this.finalizeTimer = setTimeout(() => {
       this.finalizeTimer = null;
       this.finalizeUtterance();
-    }, VoiceListener.TURN_PAUSE_MS);
+    }, pause);
+  }
+
+  // ---- PM (scenario) mode ---------------------------------------------------
+
+  /**
+   * PM mode entry: wait for the Meet roster, then hand control to the
+   * server-driven scenario engine (POST /api/bot/voice/pm/next). The engine
+   * owns the state machine; we just speak what it says, feed it what we hear,
+   * and report silence when a participant doesn't answer.
+   */
+  private async startPm(): Promise<void> {
+    const participants = await this.waitForRoster();
+    this.opts.log('[voice] PM mode — roster', { participants });
+    this.pmActive = true;
+    await this.pmEvent({ event: 'joined', participants });
+  }
+
+  /** Poll the page for participant names for up to 60s (people trickle in). */
+  private async waitForRoster(): Promise<string[]> {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (this.stopped) return [];
+      try {
+        const names = (await this.opts.getParticipants?.()) ?? [];
+        if (names.length > 0) return names;
+      } catch (e: any) {
+        this.opts.log('[voice] PM roster read failed', { error: e?.message });
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    return [];
+  }
+
+  /** One round-trip to the scenario engine; executes the returned step. */
+  private async pmEvent(payload: Record<string, unknown>): Promise<void> {
+    const base = config.talkbaseApiBase;
+    const key = config.internalApiKey;
+    if (!base || !key || this.stopped) return;
+    if (this.pmSilence) { clearTimeout(this.pmSilence); this.pmSilence = null; }
+
+    try {
+      const res = await axios.post(
+        `${base}/api/bot/voice/pm/next`,
+        { session_id: this.opts.sessionId, ...payload },
+        { headers: { 'X-Internal-API-Key': key }, timeout: 60000 },
+      );
+      const action = res.data?.action;
+      const text = res.data?.text;
+      const then = res.data?.then;
+
+      if (action === 'say' && text) {
+        await this.answerWith(text, 'ru', false);
+        if (then === 'finish') {
+          this.opts.log('[voice] PM scenario finished — back to wake-word mode');
+          this.pmActive = false;
+          return;
+        }
+        this.armPmSilence();
+        return;
+      }
+      // action === 'listen' → keep listening; no timeout (nothing was asked)
+    } catch (e: any) {
+      this.opts.log('[voice] PM step failed', { error: e?.message });
+      // Engine unreachable — retry silence-style in a minute rather than dying.
+      this.armPmSilence();
+    }
+  }
+
+  /** If the current participant says nothing for a while, tell the engine. */
+  private armPmSilence(): void {
+    if (this.pmSilence) clearTimeout(this.pmSilence);
+    this.pmSilence = setTimeout(() => {
+      this.pmSilence = null;
+      if (this.pmActive && !this.stopped) void this.pmEvent({ event: 'silence' });
+    }, VoiceListener.PM_ANSWER_TIMEOUT_MS);
   }
 
   private finalizeUtterance(): void {
@@ -196,6 +294,31 @@ export class VoiceListener {
         return idx >= 0 && idx <= 12;
       });
     const lang = this.normalizeLang(this.lastLang);
+
+    // PM scenario in progress: everything said in the meeting is scenario
+    // input. Wake-worded commands steer it («толкбейз, пропусти/заверши»),
+    // wake-worded questions still get the regular Q&A, and everything else is
+    // the current participant's standup answer.
+    if (this.pmActive) {
+      if (hit) {
+        if (/пропусти|пропустити|skip|заверши|закінч|завершить|finish|stop/u.test(lower)) {
+          this.opts.log('[voice] PM command', { utterance: utter, lang });
+          void this.pmEvent({ event: 'command', utterance: utter, language: lang });
+          return;
+        }
+        const idx = lower.indexOf(hit);
+        const question = utter.slice(idx + hit.length).replace(/^[\s,.:!?—-]+/, '').trim();
+        if (question) {
+          this.opts.log('[voice] wake word detected (during PM)', { question, lang });
+          void this.handleQuestion(question, lang);
+          return;
+        }
+        return;
+      }
+      this.opts.log('[voice] PM answer captured', { chars: utter.length, lang });
+      void this.pmEvent({ event: 'utterance', utterance: utter, language: lang });
+      return;
+    }
 
     if (hit) {
       // Take the text AFTER the wake phrase as the question.

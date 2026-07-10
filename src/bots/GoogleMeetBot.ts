@@ -769,10 +769,12 @@ export class GoogleMeetBot extends MeetBotBase {
         this._voiceListener = new VoiceListener({
           sessionId: botId ?? eventId ?? this.slightlySecretId,
           correlationId: this._correlationId,
+          mode: voiceMode === 'pm' ? 'pm' : 'reactive',
+          getParticipants: () => this.readMeetRoster(),
           log: (m, meta) => this._logger.info(m, meta ?? {}),
         });
         this._voiceListener.start();
-        this._logger.info('Voice mode — wake-word listener started');
+        this._logger.info(`Voice mode — listener started (${voiceMode})`);
       } catch (e) {
         this._logger.warn('Voice listener failed to start (continuing to record)', { error: (e as Error).message });
       }
@@ -780,6 +782,49 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Recording the meeting page
     this._logger.info('Begin recording...');
+    await this.startRecordingAndWait({ teamId, eventId, userId, botId, uploader, pushState });
+  }
+
+  /**
+   * PM mode: read the current participant display names from the Meet DOM.
+   * Meet's markup shifts constantly, so we try several signals and dedupe:
+   * video-tile containers ([data-participant-id]) with aria-label names,
+   * the self-name attribute, and per-tile "More options for X" buttons.
+   */
+  private async readMeetRoster(): Promise<string[]> {
+    if (!this.page) return [];
+    try {
+      const names = await this.page.evaluate(() => {
+        const found = new Set<string>();
+        const add = (raw: string | null | undefined) => {
+          const t = (raw ?? '').trim();
+          // Display names, not UI strings: short, no newlines.
+          if (t && t.length >= 2 && t.length <= 60 && !t.includes('\n')) found.add(t);
+        };
+
+        document.querySelectorAll('[data-participant-id]').forEach((el) => {
+          add(el.getAttribute('aria-label'));
+          add(el.getAttribute('data-self-name'));
+        });
+        document.querySelectorAll('[data-self-name]').forEach((el) => {
+          add(el.getAttribute('data-self-name'));
+        });
+        // Tile overflow menus are labeled "More options for <name>".
+        document.querySelectorAll('[aria-label^="More options for "]').forEach((el) => {
+          add((el.getAttribute('aria-label') ?? '').replace(/^More options for /, ''));
+        });
+
+        return Array.from(found);
+      });
+      this._logger.info('PM roster read', { names });
+      return names;
+    } catch (e) {
+      this._logger.warn('PM roster read failed', { error: (e as Error).message });
+      return [];
+    }
+  }
+
+  private async startRecordingAndWait({ teamId, eventId, userId, botId, uploader, pushState }: { teamId: string; eventId?: string; userId: string; botId?: string; uploader: any; pushState(state: BotStatus): void }): Promise<void> {
     await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader });
 
     this._voiceListener?.stop();
