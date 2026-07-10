@@ -24,6 +24,9 @@ export class GoogleMeetBot extends MeetBotBase {
   private _joinedWithSignedInSession = false;
   // Voice agent wake-word listener (Phase 2), active only in voice mode.
   private _voiceListener: import('../lib/voiceListener').VoiceListener | null = null;
+  // Voice mode flag — the recorder mixes the bot's own mic (TTS) into the
+  // recording only when the bot actually joined with a microphone.
+  private _voiceEnabled = false;
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -122,6 +125,7 @@ export class GoogleMeetBot extends MeetBotBase {
 
   private async joinMeeting({ url, name, teamId, userId, eventId, botId, voiceMode, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
     const voiceEnabled = voiceMode === 'reactive' || voiceMode === 'pm';
+    this._voiceEnabled = voiceEnabled;
     this._logger.info('Launching browser...');
 
     this.page = await createBrowserContext(url, this._correlationId, 'google', voiceEnabled);
@@ -897,8 +901,8 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType, mixBotMic }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string, mixBotMic: boolean }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -955,7 +959,32 @@ export class GoogleMeetBot extends MeetBotBase {
             options = { mimeType: secondaryMimeType };
           }
 
-          const mediaRecorder = new MediaRecorder(stream, { ...options });
+          // Voice mode: tab capture only carries the OTHER participants — Meet
+          // never echoes your own mic back, so the bot's TTS replies were
+          // missing from recordings. Mix the bot's mic (botmic monitor via
+          // getUserMedia) into the recorded stream. Recording-only: silence /
+          // participant detection below keeps analysing the raw tab stream.
+          let recordingStream: MediaStream = stream;
+          if (mixBotMic) {
+            try {
+              const micStream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+              });
+              const mixCtx = new AudioContext();
+              await mixCtx.resume().catch(() => undefined);
+              const mixDest = mixCtx.createMediaStreamDestination();
+              if (hasAudioTracks) {
+                mixCtx.createMediaStreamSource(stream).connect(mixDest);
+              }
+              mixCtx.createMediaStreamSource(micStream).connect(mixDest);
+              recordingStream = new MediaStream([...stream.getVideoTracks(), ...mixDest.stream.getAudioTracks()]);
+              console.log('Recorder: mixing bot mic (TTS) into the recording');
+            } catch (e) {
+              console.warn('Recorder: bot mic mix failed, recording tab audio only', e);
+            }
+          }
+
+          const mediaRecorder = new MediaRecorder(recordingStream, { ...options });
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
 
@@ -1473,7 +1502,8 @@ export class GoogleMeetBot extends MeetBotBase {
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
         primaryMimeType,
-        secondaryMimeType
+        secondaryMimeType,
+        mixBotMic: this._voiceEnabled,
       }
     );
   
