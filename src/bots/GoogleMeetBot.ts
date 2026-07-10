@@ -795,35 +795,57 @@ export class GoogleMeetBot extends MeetBotBase {
   private async readMeetRoster(): Promise<string[]> {
     if (!this.page) return [];
     try {
-      const names = await this.page.evaluate(() => {
+      const result = await this.page.evaluate(() => {
         const found = new Set<string>();
+        const debug: any[] = [];
+        // Google's icon font renders as lowercase_snake text lines (mic,
+        // more_vert, devices…) — never a display name. Same for pure digits.
+        const isJunk = (t: string) =>
+          /^[a-z0-9_]+$/.test(t) || /^\d+[:.]?\d*$/.test(t) || t.length < 2 || t.length > 60;
         const add = (raw: string | null | undefined) => {
           const t = (raw ?? '').trim();
-          // Display names, not UI strings: short, no newlines.
-          if (t && t.length >= 2 && t.length <= 60 && !t.includes('\n')) found.add(t);
+          if (t && !t.includes('\n') && !isJunk(t)) found.add(t);
         };
 
         document.querySelectorAll('[data-participant-id]').forEach((el) => {
+          const he = el as HTMLElement;
+          debug.push({
+            pid: (el.getAttribute('data-participant-id') ?? '').slice(0, 20),
+            aria: el.getAttribute('aria-label'),
+            self: el.getAttribute('data-self-name'),
+            text: (he.innerText ?? '').slice(0, 100).replace(/\n/g, '|'),
+          });
           add(el.getAttribute('aria-label'));
           add(el.getAttribute('data-self-name'));
+          // Tile name bar: first line of the tile's text that isn't icon junk.
+          const lines = (he.innerText ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
+          for (const line of lines) {
+            if (!isJunk(line)) { add(line); break; }
+          }
         });
-        document.querySelectorAll('[data-self-name]').forEach((el) => {
-          add(el.getAttribute('data-self-name'));
-        });
-        // Tile overflow menus are labeled "More options for <name>".
+        document.querySelectorAll('[data-self-name]').forEach((el) => add(el.getAttribute('data-self-name')));
         document.querySelectorAll('[aria-label^="More options for "]').forEach((el) => {
           add((el.getAttribute('aria-label') ?? '').replace(/^More options for /, ''));
         });
 
-        return Array.from(found);
+        return { names: Array.from(found), debug };
       });
-      this._logger.info('PM roster read', { names });
-      return names;
+
+      // Log the raw tile dump at most once a minute — enough to tune the
+      // selectors against the live DOM without flooding the logs.
+      const now = Date.now();
+      if (now - this._lastRosterDebugAt > 60000) {
+        this._lastRosterDebugAt = now;
+        this._logger.info('PM roster read', { names: result.names, tiles: result.debug });
+      }
+      return result.names;
     } catch (e) {
       this._logger.warn('PM roster read failed', { error: (e as Error).message });
       return [];
     }
   }
+
+  private _lastRosterDebugAt = 0;
 
   private async startRecordingAndWait({ teamId, eventId, userId, botId, uploader, pushState }: { teamId: string; eventId?: string; userId: string; botId?: string; uploader: any; pushState(state: BotStatus): void }): Promise<void> {
     await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader });
