@@ -20,12 +20,35 @@ wait_for_pulseaudio() {
     return 1
 }
 
+# Stale X locks survive a container restart (the container FS persists across a
+# host reboot), and Xvfb then refuses to start: "Server is already active for
+# display 99". This killed the bot fleet-wide after the 2026-07-21 kernel-update
+# reboot. No other X server can be running here, so the locks are always ours.
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+
 # Start Xvfb (800px height to accommodate 80px offset for address bar)
 Xvfb :99 -screen 0 1280x800x24 &
 xvfb_pid=$!
 
-# Wait a moment for Xvfb to start
-sleep 1
+# Xvfb must be up before Chrome ever launches — and if it can't start, exit
+# non-zero so Docker's restart policy recycles the container visibly instead of
+# node limping along failing every join with "Missing X server or $DISPLAY".
+xvfb_ok=""
+for _ in {1..25}; do
+    if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+        break # Xvfb process died — no point waiting for its socket
+    fi
+    if [ -S /tmp/.X11-unix/X99 ]; then
+        xvfb_ok=1
+        break
+    fi
+    sleep 0.2
+done
+if [ -z "$xvfb_ok" ]; then
+    echo "✗ FATAL: Xvfb failed to start on :99 — exiting so the container restarts"
+    exit 1
+fi
+echo "✓ Xvfb is running on :99 (PID: $xvfb_pid)"
 
 # Initialize PulseAudio for audio capture
 echo "Initializing PulseAudio..."

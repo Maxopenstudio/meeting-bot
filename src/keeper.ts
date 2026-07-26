@@ -16,6 +16,14 @@ const PORT = 3000;
 
 let lastResult: (SessionHealthResult & { ts: string }) | null = null;
 let cycleRunning = false;
+// Consecutive runCycle() failures (browser won't launch, probe threw, …). After
+// PROBE_FAILURE_ALERT_THRESHOLD the /session-health endpoint reports the failure
+// instead of a stale lastResult / eternal "pending" — otherwise a dead keeper
+// (e.g. Xvfb gone after a host reboot, 2026-07-21) keeps answering "busy" and
+// the backend never alerts while every meeting silently fails.
+let consecutiveProbeFailures = 0;
+let lastProbeError: string | null = null;
+const PROBE_FAILURE_ALERT_THRESHOLD = 2;
 // mtime (ms) of the snapshot we last imported into the profile. A signed-out
 // cycle only triggers a re-seed when the admin has uploaded a NEWER snapshot —
 // otherwise we'd pointlessly re-import the same dead cookies every cycle.
@@ -41,6 +49,8 @@ async function runCycle(): Promise<void> {
   try {
     const result = await checkGoogleSessionHealth('keeper');
     lastResult = { ...result, ts: new Date().toISOString() };
+    consecutiveProbeFailures = 0;
+    lastProbeError = null;
     console.log(`keeper: cycle done signedIn=${result.signedIn} reason="${result.reason}"`);
 
     // Self-heal: the live profile is signed out but a fresh state.json was
@@ -64,7 +74,9 @@ async function runCycle(): Promise<void> {
       }
     }
   } catch (err) {
-    console.error('keeper: cycle failed', err);
+    consecutiveProbeFailures++;
+    lastProbeError = err instanceof Error ? err.message : String(err);
+    console.error(`keeper: cycle failed (${consecutiveProbeFailures} in a row)`, err);
   } finally {
     cycleRunning = false;
   }
@@ -99,9 +111,18 @@ async function main(): Promise<void> {
     }
     if (req.url && req.url.startsWith('/session-health')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      const body = lastResult
-        ? { success: true, busy: false, ...lastResult }
-        : { success: true, busy: true, signedIn: true, pending: true };
+      // Repeated probe failures OVERRIDE any stale lastResult: success:false maps
+      // to "unreachable" on the backend → Telegram alert. One failure is allowed
+      // as transient (e.g. probe raced a profile lock).
+      const body = consecutiveProbeFailures >= PROBE_FAILURE_ALERT_THRESHOLD
+        ? {
+            success: false,
+            error: `keeper probe failed ${consecutiveProbeFailures}x in a row: ${lastProbeError ?? 'unknown'}`
+              + (lastResult ? ` (last successful probe: ${lastResult.ts})` : ''),
+          }
+        : lastResult
+          ? { success: true, busy: false, ...lastResult }
+          : { success: true, busy: true, signedIn: true, pending: true };
       res.end(JSON.stringify(body));
       return;
     }
