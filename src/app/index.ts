@@ -7,10 +7,20 @@ import microsoftRouter from './microsoft';
 import zoomRouter from './zoom';
 import { globalJobStore } from '../lib/globalJobStore';
 import { RedisConsumerService } from '../connect/RedisConsumerService';
+import { checkGoogleSessionHealth, SessionHealthResult } from '../lib/sessionHealth';
 
 const app = express();
 
 app.use(express.json());
+
+// Bearer auth for the whole API when BOT_API_TOKEN is set. /health stays open
+// (Docker HEALTHCHECK has no token); /metrics stays open for scrapers.
+const OPEN_PATHS = new Set(['/health', '/metrics']);
+app.use((req, res, next) => {
+  if (!config.apiToken || OPEN_PATHS.has(req.path)) return next();
+  if (req.headers.authorization === `Bearer ${config.apiToken}`) return next();
+  return res.status(401).json({ success: false, error: 'unauthorized' });
+});
 
 // Initialize Redis consumer service
 export const redisConsumerService = new RedisConsumerService();
@@ -26,11 +36,57 @@ app.get('/isbusy', async (req, res) => {
 
 app.get('/health', async (req, res) => {
   // Simple health check endpoint for Docker
-  return res.status(200).json({ 
-    status: 'healthy', 
+  return res.status(200).json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
+});
+
+// Voice agent test hook (Phase 1): make the bot speak a phrase into the meeting.
+// POST /say { text, voice? } — fetches TTS from TalkBase and plays it into the
+// virtual mic. Requires the bot to have joined in voice mode (mic enabled).
+app.post('/say', async (req, res) => {
+  try {
+    const { speak } = await import('../lib/speak');
+    const text = (req.body?.text || '').toString();
+    if (!text.trim()) return res.status(400).json({ success: false, error: 'text required' });
+    const ok = await speak(text, { voice: req.body?.voice, cacheable: !!req.body?.cacheable });
+    return res.status(ok ? 200 : 502).json({ success: ok });
+  } catch (e: any) {
+    return res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
+});
+
+// Liveness probe for the Google session (state.json). Launches a browser and
+// navigates to Meet to see whether the restored session is still signed in —
+// the backend polls this on a schedule and alerts (Telegram) when it goes dead,
+// so a stale session is caught BEFORE scheduled meetings silently fail to record.
+let lastSessionHealthAt = 0;
+let lastSessionHealth: SessionHealthResult | null = null;
+const SESSION_HEALTH_MIN_INTERVAL_MS = 60_000;
+
+app.get('/session-health', async (req, res) => {
+  // Single-concurrency bot: never launch a probe browser while a recording is
+  // in flight. A busy bot is, by definition, signed in and working.
+  if (globalJobStore.isBusy()) {
+    return res.status(200).json({ success: true, busy: true, signedIn: true, skipped: 'busy' });
+  }
+
+  // Cheap rate-limit so the endpoint can't be hammered into launching browsers.
+  const now = Date.now();
+  if (lastSessionHealth && now - lastSessionHealthAt < SESSION_HEALTH_MIN_INTERVAL_MS) {
+    return res.status(200).json({ success: true, busy: false, cached: true, ...lastSessionHealth });
+  }
+
+  try {
+    const result = await checkGoogleSessionHealth('session-health');
+    lastSessionHealthAt = now;
+    lastSessionHealth = result;
+    return res.status(200).json({ success: true, busy: false, cached: false, ...result });
+  } catch (e: any) {
+    return res.status(200).json({ success: false, error: e?.message || String(e) });
+  }
 });
 
 // Create a Gauge metric for busy status (0 or 1)

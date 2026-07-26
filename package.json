@@ -1,6 +1,6 @@
 {
   "name": "meeting-bot",
-  "version": "1.2.10",
+  "version": "1.2.26",
   "description": "Run meeting bots for Google Meet, Microsoft Teams and Zoom",
   "main": "index.js",
   "license": "MIT",
@@ -9,6 +9,7 @@
     "dev": "docker compose up --build",
     "stop": "docker compose down",
     "build": "tsc",
+    "test": "node -r ts-node/register --test src/util/recordingName.test.ts src/lib/sessionKeeper.test.ts",
     "lint": "eslint \"*/**/*.{js,ts}\" --quiet --fix"
   },
   "keywords": [],
@@ -47,6 +48,7 @@
     "serialize-error": "^12.0.0",
     "ts-node": "^10.9.2",
     "uuid": "^11.1.0",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
+    "ws": "^8.18.0"
   }
 }

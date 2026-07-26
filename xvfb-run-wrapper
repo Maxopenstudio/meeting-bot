@@ -10,24 +10,81 @@ trap 'echo "forwarding SIGTERM to child"; kill -SIGTERM "$child" 2>/dev/null' SI
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 echo "Using XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 
+wait_for_pulseaudio() {
+    for _ in {1..25}; do
+        if pactl info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# Stale X locks survive a container restart (the container FS persists across a
+# host reboot), and Xvfb then refuses to start: "Server is already active for
+# display 99". This killed the bot fleet-wide after the 2026-07-21 kernel-update
+# reboot. No other X server can be running here, so the locks are always ours.
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+
+# Chrome's SingletonLock in the persistent keeper profile (bind mount) survives
+# a non-graceful stop, and the recreated container has a new hostname — Chrome
+# then refuses the profile ("in use by another computer", exit 21). At wrapper
+# start no Chrome of ours is running yet, so any lock here is stale. The only
+# other legitimate profile user is the chrome-login container, and that RUNBOOK
+# procedure stops the keeper first (restart=unless-stopped keeps it stopped).
+if [ -n "$GOOGLE_CHROME_USER_DATA_DIR" ] && [ -d "$GOOGLE_CHROME_USER_DATA_DIR" ]; then
+    rm -f "$GOOGLE_CHROME_USER_DATA_DIR/SingletonLock" \
+          "$GOOGLE_CHROME_USER_DATA_DIR/SingletonSocket" \
+          "$GOOGLE_CHROME_USER_DATA_DIR/SingletonCookie"
+fi
+
 # Start Xvfb (800px height to accommodate 80px offset for address bar)
 Xvfb :99 -screen 0 1280x800x24 &
 xvfb_pid=$!
 
-# Wait a moment for Xvfb to start
-sleep 1
+# Xvfb must be up before Chrome ever launches — and if it can't start, exit
+# non-zero so Docker's restart policy recycles the container visibly instead of
+# node limping along failing every join with "Missing X server or $DISPLAY".
+xvfb_ok=""
+for _ in {1..25}; do
+    if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+        break # Xvfb process died — no point waiting for its socket
+    fi
+    if [ -S /tmp/.X11-unix/X99 ]; then
+        xvfb_ok=1
+        break
+    fi
+    sleep 0.2
+done
+if [ -z "$xvfb_ok" ]; then
+    echo "✗ FATAL: Xvfb failed to start on :99 — exiting so the container restarts"
+    exit 1
+fi
+echo "✓ Xvfb is running on :99 (PID: $xvfb_pid)"
 
 # Initialize PulseAudio for audio capture
 echo "Initializing PulseAudio..."
 pulseaudio --kill 2>/dev/null || true
-sleep 1
+for _ in {1..10}; do
+    if ! pgrep -x "pulseaudio" >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+# Stale Pulse state survives a container restart the same way the X lock does:
+# /run/user/<uid> is plain container FS (not tmpfs), and after a restart PIDs
+# start over from 1 — so a leftover pulse/pid can point at a live (unrelated)
+# process, making the daemon believe it's already running: "Daemon startup
+# failed." Only reached when no daemon is actually up (the --kill/pgrep above),
+# so the state is always ours to discard.
+rm -rf "$XDG_RUNTIME_DIR/pulse" /tmp/pulse-*
 
 # Start PulseAudio in user mode
 pulseaudio -D --exit-idle-time=-1 --log-level=info 2>&1
-sleep 5
 
 # Verify PulseAudio is running and set up virtual devices
-if pgrep -x "pulseaudio" > /dev/null; then
+if wait_for_pulseaudio && pgrep -x "pulseaudio" > /dev/null; then
     echo "✓ PulseAudio is running (PID: $(pgrep -x pulseaudio))"
 
     # Load null sink module (virtual audio output device)
@@ -37,6 +94,18 @@ if pgrep -x "pulseaudio" > /dev/null; then
     # Set as default sink (Teams will play audio here)
     pactl set-default-sink virtual_output 2>&1
     echo "✓ Set virtual_output as default sink"
+
+    # Virtual MICROPHONE for the interactive voice bot. We pacat TTS audio into
+    # a null-sink; Chrome must read it as a real mic. Chrome/WebRTC does NOT
+    # enumerate a raw sink .monitor as a microphone ("Microphone not found"), so
+    # we remap the monitor into a proper capture SOURCE and default to that.
+    BOT_MIC_SINK="${BOT_MIC_SINK:-botmic}"
+    MIC_ID=$(pactl load-module module-null-sink sink_name="${BOT_MIC_SINK}" sink_properties=device.description="BotMicSink" 2>&1)
+    echo "✓ Loaded bot mic null sink '${BOT_MIC_SINK}' (ID: ${MIC_ID})"
+    REMAP_ID=$(pactl load-module module-remap-source master="${BOT_MIC_SINK}.monitor" source_name=botmic_src source_properties=device.description="BotMic" 2>&1)
+    echo "✓ Loaded remap source 'botmic_src' from ${BOT_MIC_SINK}.monitor (ID: ${REMAP_ID})"
+    pactl set-default-source botmic_src 2>&1
+    echo "✓ Set botmic_src as default source (bot microphone)"
 
     # Verify monitor source exists for ffmpeg
     if pactl list sources short | grep -q "virtual_output.monitor"; then

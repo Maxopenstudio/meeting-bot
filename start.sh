@@ -17,18 +17,30 @@ echo "Using XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+wait_for_pulseaudio() {
+    for _ in {1..25}; do
+        if pactl info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 # Kill any existing PulseAudio processes
 pulseaudio --kill 2>/dev/null || true
-sleep 1
+for _ in {1..10}; do
+    if ! pgrep -x "pulseaudio" >/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
 
 # Start PulseAudio in user mode (simpler and more reliable)
 pulseaudio -D --exit-idle-time=-1 --log-level=info 2>&1
 
-# Wait for PulseAudio to fully initialize
-sleep 5
-
 # Verify PulseAudio is running
-if pgrep -x "pulseaudio" > /dev/null; then
+if wait_for_pulseaudio && pgrep -x "pulseaudio" > /dev/null; then
     echo "✓ PulseAudio is running (PID: $(pgrep -x pulseaudio))"
 
     # Load null sink module (virtual audio output device)
@@ -38,6 +50,16 @@ if pgrep -x "pulseaudio" > /dev/null; then
     # Set as default sink (Teams will play audio here)
     pactl set-default-sink virtual_output 2>&1
     echo "✓ Set virtual_output as default sink"
+
+    # Virtual MICROPHONE for the interactive voice bot: a null-sink whose
+    # .monitor Chrome uses as mic input. We paplay/pacat TTS audio into it so
+    # participants hear the bot speak. Only used in voice mode; harmless otherwise.
+    BOT_MIC_SINK="${BOT_MIC_SINK:-botmic}"
+    MIC_ID=$(pactl load-module module-null-sink sink_name="${BOT_MIC_SINK}" sink_properties=device.description="BotMic" 2>&1)
+    echo "✓ Loaded bot mic null sink '${BOT_MIC_SINK}' (ID: ${MIC_ID})"
+    # Make its monitor the default SOURCE so Chrome getUserMedia picks it as mic.
+    pactl set-default-source "${BOT_MIC_SINK}.monitor" 2>&1
+    echo "✓ Set ${BOT_MIC_SINK}.monitor as default source (bot microphone)"
 
     # List available sinks and sources
     echo "=== Available PulseAudio sinks ==="

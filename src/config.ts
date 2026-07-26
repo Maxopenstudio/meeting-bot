@@ -45,8 +45,22 @@ const constructRedisUri = () => {
   }
 };
 
+const normalizeFileExtension = (extension?: string) => {
+  if (!extension) return '.webm';
+  return extension.startsWith('.') ? extension : `.${extension}`;
+};
+
+const parseOptionalNumber = (value?: string) => {
+  if (typeof value === 'undefined' || value.trim() === '') return undefined;
+  return Number(value);
+};
+
 export default {
   port: process.env.PORT || 3000,
+  // Optional bearer token guarding the HTTP API (join/leave/session-health).
+  // Unset = no auth (legacy: bot reachable only inside the docker network).
+  // REQUIRED when the bot node is exposed to the internet (multi-server fleet).
+  apiToken: process.env.BOT_API_TOKEN,
   db: {
     host: process.env.DB_HOST || 'localhost',
     user: process,
@@ -57,31 +71,79 @@ export default {
     Number(process.env.MAX_RECORDING_DURATION_MINUTES) :
     180, // There's an upper limit on meeting duration 3 hours
   chromeExecutablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome', // We use Google Chrome with Playwright for recording
+  googleChromeCdpUrl: process.env.GOOGLE_CHROME_CDP_URL,
+  googleChromeUserDataDir: process.env.GOOGLE_CHROME_USER_DATA_DIR,
+  googleChromeStorageStatePath: process.env.GOOGLE_CHROME_STORAGE_STATE_PATH,
+  // Role split for multi-replica deploys: the single 'keeper' owns the live
+  // persistent Chrome profile, keeps the Google session alive, and republishes a
+  // fresh read-only state.json snapshot; 'worker' (default) joins meetings using
+  // that snapshot read-only and never writes session cookies back (no clobber).
+  botRole: (process.env.BOT_ROLE === 'keeper' ? 'keeper' : 'worker') as 'keeper' | 'worker',
+  // How often the keeper exercises + republishes the session (minutes).
+  sessionKeeperIntervalMinutes: process.env.SESSION_KEEPER_INTERVAL_MINUTES ?
+    Number(process.env.SESSION_KEEPER_INTERVAL_MINUTES) :
+    20,
+  // Whether this instance may write rotated session cookies back to state.json.
+  // Default true (preserves the legacy single-instance behaviour). In a
+  // keeper+workers deploy, set SESSION_WRITEBACK=false on the worker pods so only
+  // the keeper writes the shared snapshot — otherwise concurrent workers clobber
+  // each other's rotated cookies and the session dies.
+  sessionWriteback: process.env.SESSION_WRITEBACK !== 'false',
+  googleAnonymousJoinRequestAttempts: process.env.GOOGLE_ANONYMOUS_JOIN_REQUEST_ATTEMPTS ?
+    Number(process.env.GOOGLE_ANONYMOUS_JOIN_REQUEST_ATTEMPTS) :
+    10,
   inactivityLimit: process.env.MEETING_INACTIVITY_MINUTES ? Number(process.env.MEETING_INACTIVITY_MINUTES) : 1,
   activateInactivityDetectionAfter: process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES ? Number(process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES) :  1,
+  loneParticipantExitDelaySeconds: process.env.LONE_PARTICIPANT_EXIT_DELAY_SECONDS ? Number(process.env.LONE_PARTICIPANT_EXIT_DELAY_SECONDS) : 10,
   serviceKey: process.env.SCREENAPP_BACKEND_SERVICE_API_KEY,
   joinWaitTime: process.env.JOIN_WAIT_TIME_MINUTES ? Number(process.env.JOIN_WAIT_TIME_MINUTES) : 10,
   // Number of retries for transient errors (not applied to WaitingAtLobbyRetryError)
   retryCount: process.env.RETRY_COUNT ? Number(process.env.RETRY_COUNT) : 2,
+  teamsPrewarmEnabled: process.env.TEAMS_PREWARM_ENABLED === 'true',
+  teamsAudioStabilizationMs: process.env.TEAMS_AUDIO_STABILIZATION_MS ? Number(process.env.TEAMS_AUDIO_STABILIZATION_MS) : 1000,
   miscStorageBucket: process.env.GCP_MISC_BUCKET,
   miscStorageFolder: process.env.GCP_MISC_BUCKET_FOLDER ? process.env.GCP_MISC_BUCKET_FOLDER : 'meeting-bot',
   region: process.env.GCP_DEFAULT_REGION,
   accessKey: process.env.GCP_ACCESS_KEY_ID ?? '',
   accessSecret: process.env.GCP_SECRET_ACCESS_KEY ?? '',
   redisQueueName: process.env.REDIS_QUEUE_NAME ?? 'jobs:meetbot:list',
+  redisProcessingQueueName: process.env.REDIS_PROCESSING_QUEUE_NAME ?? 'jobs:meetbot:processing',
   redisUri: constructRedisUri(),
   // Notification: Webhook (disabled by default)
   notifyWebhookEnabled: process.env.NOTIFY_WEBHOOK_ENABLED === 'true',
   notifyWebhookUrl: process.env.NOTIFY_WEBHOOK_URL,
   // Optional secret to sign payloads (HMAC-SHA256). If set, signature will be sent in X-Webhook-Signature header
   notifyWebhookSecret: process.env.NOTIFY_WEBHOOK_SECRET,
-  // Notification: Redis (disabled by default). Uses same REDIS connection but selectable DB and list
-  notifyRedisEnabled: process.env.NOTIFY_REDIS_ENABLED === 'true',
+  // Voice agent (interactive bot). Base URL of the TalkBase API + internal key
+  // to fetch TTS audio (/api/bot/voice/tts). Base derives from the notify
+  // webhook URL when not set explicitly.
+  talkbaseApiBase: process.env.TALKBASE_API_BASE
+    || (process.env.NOTIFY_WEBHOOK_URL ? process.env.NOTIFY_WEBHOOK_URL.replace(/\/api\/bot\/notify\/?$/, '') : ''),
+  internalApiKey: process.env.INTERNAL_API_KEY,
+  // Name of the PulseAudio null-sink that acts as the bot's virtual microphone
+  // (Chrome uses its .monitor as mic input; we paplay TTS into the sink).
+  botMicSink: process.env.BOT_MIC_SINK ?? 'botmic',
+  // Soniox realtime STT for the voice agent's wake-word listener. Meeting audio
+  // is captured from this PulseAudio monitor (the default output sink).
+  sonioxApiKey: process.env.SONIOX_API_KEY,
+  meetingAudioSource: process.env.MEETING_AUDIO_SOURCE ?? 'virtual_output.monitor',
+  // Wake phrases that summon the bot (lowercased, matched anywhere in the utterance).
+  wakeWords: (process.env.BOT_WAKE_WORDS ?? 'толкбейз,talkbase,толк бейз,talk base').split(','),
+  // Slang nicknames that ALSO summon the bot, but only in address position (the
+  // start of an utterance) — words like «братан» fly around between people all
+  // the time, and the bot must not butt in on someone else's conversation.
+  // «глек» = how Soniox tends to hear «Глэк».
+  nicknameWakeWords: (process.env.BOT_NICKNAME_WAKE_WORDS
+    ?? 'кентуха,братан,глэк,глек,голова оранжевая,оранжевая голова').split(','),
+  // Notification: Redis. Explicitly enabled via NOTIFY_REDIS_ENABLED, and enabled
+  // automatically for Redis-worker mode so completed jobs are written to result list.
+  notifyRedisEnabled: process.env.NOTIFY_REDIS_ENABLED === 'true' || process.env.REDIS_CONSUMER_ENABLED === 'true',
   // If not provided, uses redisUri with specified database selection
   notifyRedisUri: process.env.NOTIFY_REDIS_URI, // optional override
-  notifyRedisDb: process.env.NOTIFY_REDIS_DB ? Number(process.env.NOTIFY_REDIS_DB) : 1, // must not default to 0
+  notifyRedisDb: parseOptionalNumber(process.env.NOTIFY_REDIS_DB),
   notifyRedisList: process.env.NOTIFY_REDIS_LIST ?? 'jobs:meetbot:recordings',
-  uploaderFileExtension: process.env.UPLOADER_FILE_EXTENSION ? process.env.UPLOADER_FILE_EXTENSION : '.webm',
+  notifyRedisFailureList: process.env.NOTIFY_REDIS_FAILURE_LIST ?? 'jobs:meetbot:failures',
+  uploaderFileExtension: normalizeFileExtension(process.env.UPLOADER_FILE_EXTENSION),
   isRedisEnabled: process.env.REDIS_CONSUMER_ENABLED === 'true',
   s3CompatibleStorage: {
     endpoint: process.env.S3_ENDPOINT,

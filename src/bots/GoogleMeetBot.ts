@@ -1,7 +1,7 @@
 import { JoinParams } from './AbstractMeetBot';
 import { BotStatus, WaitPromise } from '../types';
 import config from '../config';
-import { UnsupportedMeetingError, WaitingAtLobbyRetryError } from '../error';
+import { RecordingUploadFailedError, UnsupportedMeetingError, WaitingAtLobbyRetryError } from '../error';
 import { patchBotStatus } from '../services/botService';
 import { handleUnsupportedMeetingError, handleWaitingAtLobbyError, MeetBotBase } from './MeetBotBase';
 import { v4 } from 'uuid';
@@ -11,13 +11,22 @@ import { browserLogCaptureCallback } from '../util/logger';
 import { getWaitingPromise } from '../lib/promise';
 import { retryActionWithWait } from '../util/resilience';
 import { uploadDebugImage } from '../services/bugService';
-import createBrowserContext from '../lib/chromium';
+import createBrowserContext, { isExternalBrowserContext, persistGoogleSessionState } from '../lib/chromium';
 import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
-import { vp9MimeType, webmMimeType } from '../lib/recording';
+import { getRecordingMimeTypesForExtension } from '../lib/recording';
+import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
 
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
   private _correlationId: string;
+  // True when the pre-join screen had no name input, i.e. the Google session
+  // from state.json was accepted and we joined signed in (avatar account).
+  private _joinedWithSignedInSession = false;
+  // Voice agent wake-word listener (Phase 2), active only in voice mode.
+  private _voiceListener: import('../lib/voiceListener').VoiceListener | null = null;
+  // Voice mode flag — the recorder mixes the bot's own mic (TTS) into the
+  // recording only when the bot actually joined with a microphone.
+  private _voiceEnabled = false;
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -25,7 +34,7 @@ export class GoogleMeetBot extends MeetBotBase {
     this._correlationId = correlationId;
   }
 
-  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader }: JoinParams): Promise<void> {
+  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, voiceMode }: JoinParams): Promise<void> {
     const _state: BotStatus[] = ['processing'];
 
     const handleUpload = async () => {
@@ -37,18 +46,19 @@ export class GoogleMeetBot extends MeetBotBase {
 
     try {
       const pushState = (st: BotStatus) => _state.push(st);
-      await this.joinMeeting({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, pushState });
+      await this.joinMeeting({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, voiceMode, pushState });
 
       // Finish the upload from the temp video
       const uploadResult = await handleUpload();
 
       if (_state.includes('finished') && !uploadResult) {
         _state.splice(_state.indexOf('finished'), 1, 'failed');
+        throw new RecordingUploadFailedError('Google Meet recording completed but upload failed');
       }
 
       await patchBotStatus({ botId, eventId, provider: 'google', status: _state, token: bearerToken }, this._logger);
     } catch(error) {
-      if (!_state.includes('finished')) 
+      if (!_state.includes('finished') && !_state.includes('failed'))
         _state.push('failed');
 
       await patchBotStatus({ botId, eventId, provider: 'google', status: _state, token: bearerToken }, this._logger);
@@ -63,13 +73,34 @@ export class GoogleMeetBot extends MeetBotBase {
 
       throw error;
     } finally {
+      // Stop the voice listener regardless of exit path (Soniox WS + parec).
+      try { this._voiceListener?.stop(); } catch { /* noop */ }
+      this._voiceListener = null;
+
+      // Persist the latest cookie rotation from the whole meeting before the
+      // browser goes away (Google may rotate again mid-meeting).
+      if (this._joinedWithSignedInSession) {
+        try {
+          await persistGoogleSessionState(this.page?.context(), this._correlationId);
+        } catch {
+          // persistGoogleSessionState never throws, but stay defensive here.
+        }
+      }
+
       // Guarantee chrome subprocess tree is reaped regardless of exit path.
       // No-op if a deeper code path already closed the browser.
       try {
-        const browser = this.page?.context().browser();
-        if (browser?.isConnected()) {
+        const context = this.page?.context();
+        const browser = context?.browser();
+        if (isExternalBrowserContext(context)) {
+          await this.page?.close();
+          this._logger.info('External browser page closed in join finally');
+        } else if (browser?.isConnected()) {
           await browser.close();
           this._logger.info('Browser closed in join finally');
+        } else if (context) {
+          await context.close();
+          this._logger.info('Persistent browser context closed in join finally');
         }
       } catch (cleanupErr) {
         this._logger.warn('Browser cleanup in join finally failed (non-fatal)', { error: cleanupErr });
@@ -77,36 +108,74 @@ export class GoogleMeetBot extends MeetBotBase {
     }
   }
 
-  private async joinMeeting({ url, name, teamId, userId, eventId, botId, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
+  // Force the Google Meet UI into English via the hl=en query param. For a
+  // signed-in session Meet usually honours the ACCOUNT language over this hint,
+  // so the real fix is the bot account's language setting — but appending hl=en
+  // is a harmless best-effort safety net (e.g. for guest joins / unset accounts).
+  private withEnglishLocale(meetUrl: string): string {
+    try {
+      const parsed = new URL(meetUrl);
+      parsed.searchParams.set('hl', 'en');
+      return parsed.toString();
+    } catch {
+      // Non-absolute / malformed URL — leave it untouched rather than break navigation.
+      return meetUrl;
+    }
+  }
+
+  private async joinMeeting({ url, name, teamId, userId, eventId, botId, voiceMode, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
+    const voiceEnabled = voiceMode === 'reactive' || voiceMode === 'pm';
+    this._voiceEnabled = voiceEnabled;
     this._logger.info('Launching browser...');
 
-    this.page = await createBrowserContext(url, this._correlationId, 'google');
+    this.page = await createBrowserContext(url, this._correlationId, 'google', voiceEnabled);
 
-    this._logger.info('Navigating to Google Meet URL...');
-    await this.page.goto(url, { waitUntil: 'networkidle' });
+    // Voice mode: grant the mic up-front so Meet's getUserMedia gets the botmic
+    // device without a permission dialog (mic input = botmic.monitor, silent
+    // until the bot plays TTS into the sink).
+    if (voiceEnabled) {
+      await this.page.context().grantPermissions(['microphone'], { origin: 'https://meet.google.com' }).catch((e) =>
+        this._logger.warn('Voice mode: grantPermissions(microphone) failed (continuing)', { error: (e as Error).message }),
+      );
+    }
 
-    this._logger.info('Waiting for 10 seconds...');
-    await this.page.waitForTimeout(10000);
+    const meetUrl = this.withEnglishLocale(url);
+    this._logger.info('Navigating to Google Meet URL...', { meetUrl });
+    await this.page.goto(meetUrl, { waitUntil: 'domcontentloaded' });
 
-    const dismissDeviceCheck = async () => {
-      try {
-        this._logger.info('Clicking Continue without microphone and camera button...');
-        await retryActionWithWait(
-          'Clicking the "Continue without microphone and camera" button',
-          async () => {
-            await this.page.getByRole('button', { name: 'Continue without microphone and camera' }).waitFor({ timeout: 30000 });
-            await this.page.getByRole('button', { name: 'Continue without microphone and camera' }).click();
-          },
-          this._logger,
-          1,
-          15000,
-        );
-      } catch (dismissError) {
-        this._logger.info('Continue without microphone and camera button is probably missing!...');
+    const nameInputSelector = 'input[type="text"]';
+    const clickContinueWithoutDevicesIfPresent = async (timeout = 5000) => {
+      // Voice mode: the bot MUST join with a microphone (the botmic virtual
+      // device) so it can speak. Don't dismiss the mic — let Meet join with it.
+      if (voiceEnabled) {
+        this._logger.info('Voice mode — keeping microphone (skip "continue without devices")');
+        return false;
       }
+      const continueWithoutDevicesButton = this.page
+        .locator('button')
+        .filter({ hasText: /Continue without microphone and camera|Ohne Mikrofon und Kamera fortfahren/i })
+        .first();
+
+      const hasContinuePrompt = await continueWithoutDevicesButton.isVisible({ timeout }).catch(() => false);
+      if (hasContinuePrompt) {
+        this._logger.info('Clicking Continue without microphone and camera button...');
+        await continueWithoutDevicesButton.click();
+        return true;
+      }
+
+      return false;
     };
 
-    await dismissDeviceCheck();
+    const waitForPreJoinReady = async () => {
+      await clickContinueWithoutDevicesIfPresent();
+      await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 15000 });
+    };
+
+    try {
+      await waitForPreJoinReady();
+    } catch (dismissError) {
+      this._logger.info('Continue without microphone and camera button is probably missing!...');
+    }
 
     const verifyItIsOnGoogleMeetPage = async (): Promise<'SIGN_IN_PAGE' | 'GOOGLE_MEET_PAGE' | 'UNSUPPORTED_PAGE' | null> => {
       try {
@@ -146,92 +215,248 @@ export class GoogleMeetBot extends MeetBotBase {
       this._logger.info('Google Meet bot is on the unsupported page...', { googleMeetPageStatus, userId, teamId });
     }
 
-    this._logger.info('Waiting for the input field to be visible...');
-    await retryActionWithWait(
-      'Waiting for the input field',
-      async () => await this.page.waitForSelector('input[type="text"][aria-label="Your name"]', { timeout: 10000 }),
-      this._logger,
-      3,
-      15000,
-      async () => {
-        await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'text-input-field-wait', userId, this._logger, botId);
-      }
-    );
-    
-    this._logger.info('Waiting for 10 seconds...');
-    await this.page.waitForTimeout(10000);
+    const displayName = getGoogleMeetDisplayName(name);
+    if (displayName !== name?.trim()) {
+      this._logger.info('Adjusted Google Meet display name before joining...', {
+        originalName: name,
+        displayName,
+        userId,
+        teamId
+      });
+    }
 
-    this._logger.info('Filling the input field with the name...');
-    await this.page.fill('input[type="text"][aria-label="Your name"]', name ? name : 'ScreenApp Notetaker');
+    let joinedMeeting = false;
+    const maxJoinRequestAttempts = Math.max(1, config.googleAnonymousJoinRequestAttempts);
+    try {
+      for (let joinRequestAttempt = 1; joinRequestAttempt <= maxJoinRequestAttempts; joinRequestAttempt++) {
+        if (joinRequestAttempt > 1) {
+          this._logger.info('Retrying anonymous Google Meet join request...', {
+            joinRequestAttempt,
+            maxJoinRequestAttempts,
+            userId,
+            teamId
+          });
 
-    this._logger.info('Waiting for 10 seconds...');
-    await this.page.waitForTimeout(10000);
-    
-    await retryActionWithWait(
-      'Clicking the "Ask to join" button',
-      async () => {
-        // Using the Order of most probable detection
-        const possibleTexts = [
-          'Ask to join',
-          'Join now',
-          'Join anyway',
-        ];
+          await this.page.goto(meetUrl, { waitUntil: 'domcontentloaded' });
 
-        let buttonClicked = false;
-
-        for (const text of possibleTexts) {
           try {
-            const button = await this.page.locator('button', { hasText: new RegExp(text.toLocaleLowerCase(), 'i') }).first();
-            if (await button.count() > 0) {
-              await button.click({ timeout: 5000 });
-              buttonClicked = true;
-              this._logger.info(`Success clicked using "${text}" action...`);
-              break;
-            }
-          } catch(err) {
-            this._logger.warn(`Unable to click using "${text}" action...`);
+            await waitForPreJoinReady();
+          } catch (dismissError) {
+            this._logger.info('Continue without microphone and camera button is probably missing during retry!...');
           }
         }
 
-        // Throws to initiate retries
-        if (!buttonClicked) {
-          throw new Error('Unable to complete the join action...');
+        // Guest joins show a name input; signed-in joins (GOOGLE_CHROME_STORAGE_STATE_PATH)
+        // don't — the name comes from the account. Probe briefly: if the field shows,
+        // fill it (guest); if not, we're signed in → skip straight to the join button
+        // instead of failing the whole join on a missing field.
+        this._logger.info('Probing for the name input field...', {
+          joinRequestAttempt,
+          maxJoinRequestAttempts
+        });
+        let nameFieldVisible = false;
+        try {
+          await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 12000 });
+          nameFieldVisible = true;
+          if (config.googleChromeStorageStatePath) {
+            this._logger.warn('Name input shown despite a configured storage state — Google session is dead/stale, joining as GUEST...', {
+              joinRequestAttempt,
+              maxJoinRequestAttempts,
+              userId,
+              teamId
+            });
+          }
+        } catch {
+          this._logger.info('No name input — signed-in session, skipping name step...', {
+            joinRequestAttempt,
+            maxJoinRequestAttempts
+          });
         }
-      },
-      this._logger,
-      3,
-      15000,
-      async () => {
-        await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'ask-to-join-button-click', userId, this._logger, botId);
-      }
-    );
+        this._joinedWithSignedInSession = !nameFieldVisible;
 
-    // Do this to ensure meeting bot has joined the meeting
+        if (nameFieldVisible) {
+          this._logger.info('Filling the input field with the name...');
+          await this.page.locator(nameInputSelector).first().fill(displayName);
+        }
 
-    try {
-      const wanderingTime = config.joinWaitTime * 60 * 1000; // Give some time to admit the bot
+        // DEBUG: capture the pre-join screen right before we look for the join
+        // button — lets us see what the signed-in flow actually renders.
+        try {
+          await uploadDebugImage(
+            await this.page.screenshot({ type: 'png', fullPage: true }),
+            `prejoin-signedin-${nameFieldVisible ? 'guest' : 'signed'}`,
+            userId,
+            this._logger,
+            botId
+          );
+        } catch (e) {
+          this._logger.info('prejoin debug screenshot failed', { error: (e as Error)?.message });
+        }
 
-      let waitTimeout: NodeJS.Timeout;
-      let waitInterval: NodeJS.Timeout;
+        await retryActionWithWait(
+          'Clicking the "Ask to join" button',
+          async () => {
+            // Using the Order of most probable detection. Signed-in bots render
+            // Meet in the ACCOUNT's language (overriding the browser locale), so
+            // we match join-button text in EN / DE / RU / UA. Matching is
+            // case-insensitive substring, so e.g. 'Присоединиться' also catches
+            // 'Попросить присоединиться'.
+            const possibleTexts = [
+              'Ask to join',
+              'Join now',
+              'Join anyway',
+              'Teilnahme erbitten',
+              'Jetzt teilnehmen',
+              'Trotzdem teilnehmen',
+              'Присоединиться',                // RU: Join / Join now
+              'Попросить присоединиться',       // RU: Ask to join
+              'Приєднатися',                    // UA: Join / Join now
+              'Попросити дозвіл приєднатися',   // UA: Ask to join
+            ];
 
-      const waitAtLobbyPromise = new Promise<boolean>((resolveWaiting) => {
-        waitTimeout = setTimeout(() => {
-          clearInterval(waitInterval);
-          resolveWaiting(false);
-        }, wanderingTime);
+            let buttonClicked = false;
 
-        waitInterval = setInterval(async () => {
-          try {
-            const detectLobbyModeHostWaitingText = async (): Promise<'WAITING_FOR_HOST_TO_ADMIT_BOT' | 'WAITING_REQUEST_TIMEOUT' | 'LOBBY_MODE_NOT_ACTIVE' | 'UNABLE_TO_DETECT_LOBBY_MODE'> => {
+            for (const text of possibleTexts) {
               try {
-                const lobbyModeHostWaitingText = await this.page.getByText(GOOGLE_LOBBY_MODE_HOST_TEXT);
-                if (await lobbyModeHostWaitingText.count() > 0 && await lobbyModeHostWaitingText.isVisible()) {
-                  return 'WAITING_FOR_HOST_TO_ADMIT_BOT';
+                const clickedByDomText = await this.page.evaluate((buttonText) => {
+                  const buttons = Array.from(document.querySelectorAll('button'));
+                  const button = buttons.find((element) => {
+                    const rect = element.getBoundingClientRect();
+                    const visible = rect.width > 0 && rect.height > 0;
+                    return visible &&
+                      !element.disabled &&
+                      (element.innerText || '').toLowerCase().includes(buttonText.toLowerCase());
+                  });
+
+                  if (!button) {
+                    return false;
+                  }
+
+                  button.click();
+                  return true;
+                }, text);
+
+                if (clickedByDomText) {
+                  buttonClicked = true;
+                  this._logger.info(`Success clicked using "${text}" action...`, {
+                    joinRequestAttempt,
+                    maxJoinRequestAttempts
+                  });
+                  break;
                 }
 
-                const lobbyModeRequestTimeoutText = await this.page.getByText(GOOGLE_REQUEST_TIMEOUT);
-                if (await lobbyModeRequestTimeoutText.count() > 0 && await lobbyModeRequestTimeoutText.isVisible()) {
-                  return 'WAITING_REQUEST_TIMEOUT';
+                const button = this.page.locator('button', { hasText: new RegExp(text, 'i') }).first();
+                if (await button.isVisible({ timeout: 3000 }).catch(() => false) && await button.isEnabled({ timeout: 3000 }).catch(() => false)) {
+                  await button.click({ timeout: 5000 });
+                  buttonClicked = true;
+                  this._logger.info(`Success clicked using "${text}" action...`, {
+                    joinRequestAttempt,
+                    maxJoinRequestAttempts
+                  });
+                  break;
+                }
+              } catch(err) {
+                this._logger.warn(`Unable to click using "${text}" action...`);
+              }
+            }
+
+            // Throws to initiate retries
+            if (!buttonClicked) {
+              throw new Error('Unable to complete the join action...');
+            }
+          },
+          this._logger,
+          3,
+          15000,
+          async () => {
+            await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'ask-to-join-button-click', userId, this._logger, botId);
+          }
+        );
+
+        await clickContinueWithoutDevicesIfPresent();
+
+        // DEBUG: dump the post-join page so we can read the EXACT localized button
+        // aria-labels + body text (e.g. Russian) and add them to the detectors.
+        try {
+          await new Promise((r) => setTimeout(r, 7000));
+          const dump = await this.page.evaluate(() => ({
+            url: location.href,
+            bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 1200),
+            ariaLabels: Array.from(document.querySelectorAll('button[aria-label]'))
+              .map((b) => b.getAttribute('aria-label'))
+              .filter(Boolean)
+              .slice(0, 50),
+          }));
+          this._logger.info('POSTJOIN_DEBUG ' + JSON.stringify(dump));
+        } catch (e) {
+          this._logger.info('postjoin debug failed', { error: (e as Error)?.message });
+        }
+
+        // Do this to ensure meeting bot has joined the meeting
+        const wanderingTime = config.joinWaitTime * 60 * 1000; // Give some time to admit the bot
+
+        let waitTimeout: NodeJS.Timeout;
+        let waitInterval: NodeJS.Timeout;
+        let redirectedFromMeetUrl: string | undefined;
+        let redirectedFromMeetBodyText: string | undefined;
+        let lobbyRequestTimedOut = false;
+
+        const waitAtLobbyPromise = new Promise<boolean>((resolveWaiting) => {
+          waitTimeout = setTimeout(() => {
+            clearInterval(waitInterval);
+            resolveWaiting(false);
+          }, wanderingTime);
+
+          waitInterval = setInterval(async () => {
+            try {
+              const currentUrl = this.page.url();
+              if (!currentUrl.includes('meet.google.com')) {
+                redirectedFromMeetUrl = currentUrl;
+                redirectedFromMeetBodyText = await this.page.evaluate(() => document.body.innerText).catch(() => '');
+                this._logger.error('Google Meet Bot was redirected away from the meeting while waiting for admission...', {
+                  currentUrl,
+                  bodyText: redirectedFromMeetBodyText,
+                  userId,
+                  teamId,
+                  joinRequestAttempt,
+                  maxJoinRequestAttempts
+                });
+
+                clearInterval(waitInterval);
+                clearTimeout(waitTimeout);
+
+                try {
+                  await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'google-meet-redirected-away', userId, this._logger, botId);
+                } catch (debugImageError) {
+                  this._logger.warn('Unable to upload Google Meet redirect debug image...', { error: debugImageError });
+                }
+
+                resolveWaiting(false);
+                return;
+              }
+
+            const detectLobbyModeHostWaitingText = async (): Promise<'WAITING_FOR_HOST_TO_ADMIT_BOT' | 'WAITING_REQUEST_TIMEOUT' | 'LOBBY_MODE_NOT_ACTIVE' | 'UNABLE_TO_DETECT_LOBBY_MODE'> => {
+              try {
+                const lobbyHostWaitingTexts = [
+                  GOOGLE_LOBBY_MODE_HOST_TEXT,
+                  'Bitte warten Sie, bis Sie vom Organisator',
+                ];
+                for (const text of lobbyHostWaitingTexts) {
+                  const lobbyModeHostWaitingText = await this.page.getByText(text);
+                  if (await lobbyModeHostWaitingText.count() > 0 && await lobbyModeHostWaitingText.first().isVisible()) {
+                    return 'WAITING_FOR_HOST_TO_ADMIT_BOT';
+                  }
+                }
+
+                const requestTimeoutTexts = [
+                  GOOGLE_REQUEST_TIMEOUT,
+                  'Niemand hat auf Ihre Teilnahmeanfrage geantwortet',
+                ];
+                for (const text of requestTimeoutTexts) {
+                  const lobbyModeRequestTimeoutText = await this.page.getByText(text);
+                  if (await lobbyModeRequestTimeoutText.count() > 0 && await lobbyModeRequestTimeoutText.first().isVisible()) {
+                    return 'WAITING_REQUEST_TIMEOUT';
+                  }
                 }
 
                 return 'LOBBY_MODE_NOT_ACTIVE';
@@ -247,7 +472,7 @@ export class GoogleMeetBot extends MeetBotBase {
             let botWasDeniedAccess = false;
 
             try {
-              peopleElement = await this.page.waitForSelector('button[aria-label="People"]', { timeout: 5000 });
+              peopleElement = await this.page.locator('button[aria-label^="People"], button[aria-label^="Personen"]').first().isVisible({ timeout: 500 }).catch(() => false);
             } catch(e) {
               this._logger.error(
                 'wait error', { error: e }
@@ -256,7 +481,7 @@ export class GoogleMeetBot extends MeetBotBase {
             }
 
             try {
-              callButtonElement = await this.page.waitForSelector('button[aria-label="Leave call"]', { timeout: 5000 });
+              callButtonElement = await this.page.locator('button[aria-label="Leave call"], button[aria-label="Anruf verlassen"]').first().isVisible({ timeout: 500 }).catch(() => false);
             } catch(e) {
               this._logger.error(
                 'wait error', { error: e }
@@ -271,6 +496,7 @@ export class GoogleMeetBot extends MeetBotBase {
                 this._logger.info('Lobbdy Mode: Google Meet Bot is waiting for the host to admit it...', { userId, teamId });
               } else if (lobbyModeHostWaitingText === 'WAITING_REQUEST_TIMEOUT') {
                 this._logger.info('Lobby Mode: Google Meet Bot join request timed out...', { userId, teamId });
+                lobbyRequestTimedOut = true;
                 clearInterval(waitInterval);
                 clearTimeout(waitTimeout);
                 resolveWaiting(false);
@@ -305,16 +531,21 @@ export class GoogleMeetBot extends MeetBotBase {
                       const bodyText = document.body.innerText;
                       if (bodyText.includes('You have joined the call') ||
                           bodyText.includes('other person in the call') ||
-                          bodyText.includes('people in the call')) {
+                          bodyText.includes('people in the call') ||
+                          bodyText.includes('Du nimmst an diesem Anruf teil') ||
+                          bodyText.includes('Der Anruf hat einen weiteren Teilnehmer') ||
+                          bodyText.includes('Teilnehmer sind beigetreten')) {
                         return true;
                       }
 
                       // Fallback: Check for Leave call button which indicates we're in a call
-                      const leaveCallButton = document.querySelector('button[aria-label="Leave call"]');
+                      const leaveCallButton = document.querySelector('button[aria-label="Leave call"], button[aria-label="Anruf verlassen"]');
                       if (leaveCallButton) {
                         // If we have Leave call button AND no lobby mode text, we're likely in the call
                         const hasLobbyText = bodyText.includes('Asking to join') ||
-                                            bodyText.includes('You\'re the only one here');
+                                            bodyText.includes('You\'re the only one here') ||
+                                            bodyText.includes('Teilnahme erbitten') ||
+                                            bodyText.includes('Bitte warten Sie, bis Sie vom Organisator');
                         if (!hasLobbyText) {
                           return true;
                         }
@@ -364,32 +595,81 @@ export class GoogleMeetBot extends MeetBotBase {
             );
             // Do nothing
           }
-        }, 20000);
+        }, 2000);
       });
 
       const waitingAtLobbySuccess = await waitAtLobbyPromise;
+      if (waitingAtLobbySuccess) {
+        joinedMeeting = true;
+        break;
+      }
+
       if (!waitingAtLobbySuccess) {
-        const bodyText = await this.page.evaluate(() => document.body.innerText);
+        const bodyText = redirectedFromMeetBodyText ?? await this.page.evaluate(() => document.body.innerText);
 
         const userDenied = (bodyText || '')?.includes(GOOGLE_REQUEST_DENIED);
 
-        this._logger.error('Cant finish wait at the lobby check', { userDenied, waitingAtLobbySuccess, bodyText });
+        this._logger.error('Cant finish wait at the lobby check', {
+          userDenied,
+          waitingAtLobbySuccess,
+          redirectedFromMeetUrl,
+          lobbyRequestTimedOut,
+          joinRequestAttempt,
+          maxJoinRequestAttempts,
+          bodyText
+        });
 
-        // Don't retry lobby errors - if user doesn't admit bot, retrying won't help
-        throw new WaitingAtLobbyRetryError('Google Meet bot could not enter the meeting...', bodyText ?? '', false, 0);
+        const shouldRetryJoinRequest = !userDenied &&
+          joinRequestAttempt < maxJoinRequestAttempts &&
+          (Boolean(redirectedFromMeetUrl) || lobbyRequestTimedOut);
+
+        if (shouldRetryJoinRequest) {
+          continue;
+        }
+
+        const errorMessage = redirectedFromMeetUrl ?
+          `Google Meet bot was redirected away from the meeting while waiting for admission: ${redirectedFromMeetUrl}` :
+          'Google Meet bot could not enter the meeting...';
+        throw new WaitingAtLobbyRetryError(errorMessage, bodyText ?? '', false, 0);
+      }
+      }
+
+      if (!joinedMeeting) {
+        throw new WaitingAtLobbyRetryError('Google Meet bot could not enter the meeting...', '', false, 0);
       }
     } catch(lobbyError) {
+      // Google rotated the bound-session cookies during this attempt even though
+      // the join failed (e.g. nobody admitted the bot). Write them back BEFORE
+      // closing the browser — otherwise the file keeps the already-used chain and
+      // Google revokes the whole session on its next use (observed on prod:
+      // lobby timeout → lost rotation → signed_out within 30 min).
+      if (this._joinedWithSignedInSession) {
+        await persistGoogleSessionState(this.page.context(), this._correlationId);
+      }
+
       this._logger.info('Closing the browser on error...', lobbyError);
-      await this.page.context().browser()?.close();
+      if (isExternalBrowserContext(this.page.context())) {
+        await this.page.close();
+      } else {
+        await this.page.context().browser()?.close();
+      }
 
       throw lobbyError;
     }
 
     pushState('joined');
 
+    // Google rotated the bound-session cookies during this navigation; write
+    // them back so the next join/health-probe uses the live chain instead of
+    // the now-stale snapshot. Only for signed-in joins — persisting a guest
+    // context would overwrite a freshly uploaded session with empty cookies.
+    if (this._joinedWithSignedInSession) {
+      await persistGoogleSessionState(this.page.context(), this._correlationId);
+    }
+
     try {
       this._logger.info('Waiting for the "Got it" button...');
-      await this.page.waitForSelector('button:has-text("Got it")', { timeout: 15000 });
+      await this.page.waitForSelector('button:has-text("Got it")', { timeout: 3000 });
 
       this._logger.info('Going to click all visible "Got it" buttons...');
 
@@ -428,13 +708,13 @@ export class GoogleMeetBot extends MeetBotBase {
             gotItButtonsClicked++;
             this._logger.info(`Clicked a "Got it" button #${gotItButtonsClicked}`);
             
-            await this.page.waitForTimeout(2000);
+            await this.page.waitForTimeout(500);
           } catch (err) {
             this._logger.warn('Click failed, possibly already dismissed', { error: err });
           }
         }
       
-        await this.page.waitForTimeout(2000);
+        await this.page.waitForTimeout(500);
       }
     } catch (error) {
       // Log and ignore this error
@@ -485,9 +765,97 @@ export class GoogleMeetBot extends MeetBotBase {
       this._logger.info('Error checking/dismissing device notifications...', { error });
     }
 
+    // Voice mode: start the wake-word listener alongside recording. It streams
+    // the meeting audio to Soniox and answers when addressed ("Эй, толкбейз…").
+    if (voiceEnabled) {
+      try {
+        const { VoiceListener } = await import('../lib/voiceListener');
+        this._voiceListener = new VoiceListener({
+          sessionId: botId ?? eventId ?? this.slightlySecretId,
+          correlationId: this._correlationId,
+          mode: voiceMode === 'pm' ? 'pm' : 'reactive',
+          getParticipants: () => this.readMeetRoster(),
+          selfName: name,
+          log: (m, meta) => this._logger.info(m, meta ?? {}),
+        });
+        this._voiceListener.start();
+        this._logger.info(`Voice mode — listener started (${voiceMode})`);
+      } catch (e) {
+        this._logger.warn('Voice listener failed to start (continuing to record)', { error: (e as Error).message });
+      }
+    }
+
     // Recording the meeting page
     this._logger.info('Begin recording...');
+    await this.startRecordingAndWait({ teamId, eventId, userId, botId, uploader, pushState });
+  }
+
+  /**
+   * PM mode: read the current participant display names from the Meet DOM.
+   * Meet's markup shifts constantly, so we try several signals and dedupe:
+   * video-tile containers ([data-participant-id]) with aria-label names,
+   * the self-name attribute, and per-tile "More options for X" buttons.
+   */
+  private async readMeetRoster(): Promise<string[]> {
+    if (!this.page) return [];
+    try {
+      const result = await this.page.evaluate(() => {
+        const found = new Set<string>();
+        const debug: any[] = [];
+        // Google's icon font renders as lowercase_snake text lines (mic,
+        // more_vert, devices…) — never a display name. Same for pure digits.
+        const isJunk = (t: string) =>
+          /^[a-z0-9_]+$/.test(t) || /^\d+[:.]?\d*$/.test(t) || t.length < 2 || t.length > 60;
+        const add = (raw: string | null | undefined) => {
+          const t = (raw ?? '').trim();
+          if (t && !t.includes('\n') && !isJunk(t)) found.add(t);
+        };
+
+        document.querySelectorAll('[data-participant-id]').forEach((el) => {
+          const he = el as HTMLElement;
+          debug.push({
+            pid: (el.getAttribute('data-participant-id') ?? '').slice(0, 20),
+            aria: el.getAttribute('aria-label'),
+            self: el.getAttribute('data-self-name'),
+            text: (he.innerText ?? '').slice(0, 100).replace(/\n/g, '|'),
+          });
+          add(el.getAttribute('aria-label'));
+          add(el.getAttribute('data-self-name'));
+          // Tile name bar: first line of the tile's text that isn't icon junk.
+          const lines = (he.innerText ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
+          for (const line of lines) {
+            if (!isJunk(line)) { add(line); break; }
+          }
+        });
+        document.querySelectorAll('[data-self-name]').forEach((el) => add(el.getAttribute('data-self-name')));
+        document.querySelectorAll('[aria-label^="More options for "]').forEach((el) => {
+          add((el.getAttribute('aria-label') ?? '').replace(/^More options for /, ''));
+        });
+
+        return { names: Array.from(found), debug };
+      });
+
+      // Log the raw tile dump at most once a minute — enough to tune the
+      // selectors against the live DOM without flooding the logs.
+      const now = Date.now();
+      if (now - this._lastRosterDebugAt > 60000) {
+        this._lastRosterDebugAt = now;
+        this._logger.info('PM roster read', { names: result.names, tiles: result.debug });
+      }
+      return result.names;
+    } catch (e) {
+      this._logger.warn('PM roster read failed', { error: (e as Error).message });
+      return [];
+    }
+  }
+
+  private _lastRosterDebugAt = 0;
+
+  private async startRecordingAndWait({ teamId, eventId, userId, botId, uploader, pushState }: { teamId: string; eventId?: string; userId: string; botId?: string; uploader: any; pushState(state: BotStatus): void }): Promise<void> {
     await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader });
+
+    this._voiceListener?.stop();
+    this._voiceListener = null;
 
     pushState('finished');
   }
@@ -498,6 +866,7 @@ export class GoogleMeetBot extends MeetBotBase {
   ): Promise<void> {
     const duration = config.maxRecordingDuration * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
+    const loneParticipantExitDelayMs = config.loneParticipantExitDelaySeconds * 1000;
 
     // Capture and send the browser console logs to Node.js context
     this.page?.on('console', async msg => {
@@ -515,9 +884,12 @@ export class GoogleMeetBot extends MeetBotBase {
       await uploader.saveDataToTempFile(buffer);
     });
 
-    await this.page.exposeFunction('screenAppMeetEnd', (slightlySecretId: string) => {
+    await this.page.exposeFunction('screenAppMeetEnd', (slightlySecretId: string, recordedDurationSeconds?: number) => {
       if (slightlySecretId !== this.slightlySecretId) return;
       try {
+        if (typeof recordedDurationSeconds === 'number') {
+          uploader.setRecordingDuration(recordedDurationSeconds);
+        }
         this._logger.info('Attempt to end meeting early...');
         waitingPromise.resolveEarly();
       } catch (error) {
@@ -525,12 +897,13 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     });
 
+    const { primaryMimeType, secondaryMimeType } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
+
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType }: 
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType, mixBotMic }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string, mixBotMic: boolean }) => {
         let timeoutId: NodeJS.Timeout;
-        let inactivityParticipantDetectionTimeout: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
 
@@ -548,7 +921,7 @@ export class GoogleMeetBot extends MeetBotBase {
         };
 
         async function startRecording() {
-          console.log('Will activate inactivity detection (participant + silence checks) after', activateInactivityDetectionAfter);
+          console.log('Participant detection is active immediately; silence detection activates after', activateInactivityDetectionAfter);
 
           // Check for the availability of the mediaDevices API
           if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -586,60 +959,107 @@ export class GoogleMeetBot extends MeetBotBase {
             options = { mimeType: secondaryMimeType };
           }
 
-          const mediaRecorder = new MediaRecorder(stream, { ...options });
+          // Voice mode: tab capture only carries the OTHER participants — Meet
+          // never echoes your own mic back, so the bot's TTS replies were
+          // missing from recordings. Mix the bot's mic (botmic monitor via
+          // getUserMedia) into the recorded stream. Recording-only: silence /
+          // participant detection below keeps analysing the raw tab stream.
+          let recordingStream: MediaStream = stream;
+          if (mixBotMic) {
+            try {
+              const micStream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+              });
+              const mixCtx = new AudioContext();
+              await mixCtx.resume().catch(() => undefined);
+              const mixDest = mixCtx.createMediaStreamDestination();
+              if (hasAudioTracks) {
+                mixCtx.createMediaStreamSource(stream).connect(mixDest);
+              }
+              mixCtx.createMediaStreamSource(micStream).connect(mixDest);
+              recordingStream = new MediaStream([...stream.getVideoTracks(), ...mixDest.stream.getAudioTracks()]);
+              console.log('Recorder: mixing bot mic (TTS) into the recording');
+            } catch (e) {
+              console.warn('Recorder: bot mic mix failed, recording tab audio only', e);
+            }
+          }
 
-          mediaRecorder.ondataavailable = async (event: BlobEvent) => {
+          const mediaRecorder = new MediaRecorder(recordingStream, { ...options });
+          let chunkUploadChain: Promise<void> = Promise.resolve();
+          let isStoppingRecording = false;
+
+          mediaRecorder.ondataavailable = (event: BlobEvent) => {
             if (!event.data.size) {
               console.warn('Received empty chunk...');
               return;
             }
-            try {
-              const arrayBuffer = await event.data.arrayBuffer();
-              sendChunkToServer(arrayBuffer);
-            } catch (error) {
-              console.error('Error uploading chunk:', error);
-            }
+
+            const chunk = event.data;
+            chunkUploadChain = chunkUploadChain.then(async () => {
+              try {
+                const arrayBuffer = await chunk.arrayBuffer();
+                await sendChunkToServer(arrayBuffer);
+              } catch (error) {
+                console.error('Error uploading chunk:', error);
+              }
+            });
           };
 
           // Start recording with 2-second intervals
           const chunkDuration = 2000;
           mediaRecorder.start(chunkDuration);
+          const recordingStartedAt = Date.now();
+          const initialAloneGraceMs = activateInactivityDetectionAfterMinutes * 60 * 1000;
 
           let dismissModalsInterval: NodeJS.Timeout;
           let lastDimissError: Error | null = null;
 
           const stopTheRecording = async () => {
-            mediaRecorder.stop();
-            stream.getTracks().forEach((track) => track.stop());
+            if (isStoppingRecording) return;
+            isStoppingRecording = true;
+            const recordedDurationSeconds = Math.max(1, Math.round((Date.now() - recordingStartedAt) / 1000));
 
-            // Cleanup recording timer
-            clearTimeout(timeoutId);
+            try {
+              await new Promise<void>((resolve) => {
+                if (mediaRecorder.state === 'inactive') {
+                  resolve();
+                  return;
+                }
+                mediaRecorder.addEventListener('stop', () => resolve(), { once: true });
+                mediaRecorder.stop();
+              });
+              await chunkUploadChain;
+            } catch (error) {
+              console.error('Error stopping recorder or flushing final chunks:', error);
+            } finally {
+              stream.getTracks().forEach((track) => track.stop());
 
-            // Cancel the perpetural checks
-            if (inactivityParticipantDetectionTimeout) {
-              clearTimeout(inactivityParticipantDetectionTimeout);
-            }
-            if (inactivitySilenceDetectionTimeout) {
-              clearTimeout(inactivitySilenceDetectionTimeout);
-            }
+              // Cleanup recording timer
+              clearTimeout(timeoutId);
 
-            if (loneTest) {
-              clearTimeout(loneTest);
-            }
-
-            if (isOnValidGoogleMeetPageInterval) {
-              clearInterval(isOnValidGoogleMeetPageInterval);
-            }
-
-            if (dismissModalsInterval) {
-              clearInterval(dismissModalsInterval);
-              if (lastDimissError && lastDimissError instanceof Error) {
-                console.error('Error dismissing modals:', { lastDimissError, message: lastDimissError?.message });
+              // Cancel the perpetural checks
+              if (inactivitySilenceDetectionTimeout) {
+                clearTimeout(inactivitySilenceDetectionTimeout);
               }
-            }
 
-            // Begin browser cleanup
-            (window as any).screenAppMeetEnd(slightlySecretId);
+              if (loneTest) {
+                clearTimeout(loneTest);
+              }
+
+              if (isOnValidGoogleMeetPageInterval) {
+                clearInterval(isOnValidGoogleMeetPageInterval);
+              }
+
+              if (dismissModalsInterval) {
+                clearInterval(dismissModalsInterval);
+                if (lastDimissError && lastDimissError instanceof Error) {
+                  console.error('Error dismissing modals:', { lastDimissError, message: lastDimissError?.message });
+                }
+              }
+
+              // Begin browser cleanup
+              (window as any).screenAppMeetEnd(slightlySecretId, recordedDurationSeconds);
+            }
           };
 
           let loneTest: NodeJS.Timeout;
@@ -647,6 +1067,27 @@ export class GoogleMeetBot extends MeetBotBase {
           let loneTestDetectionActive = true;
           const maxDetectionFailures = 10; // Track up to 10 consecutive failures
           let lastBadgeLogTime = 0; // Track last time we logged badge count
+          let hasSeenOtherParticipant = false;
+          let aloneSince: number | null = null;
+
+          const shouldStopForParticipantCount = (contributors: number) => {
+            const now = Date.now();
+            if (contributors >= 2) {
+              hasSeenOtherParticipant = true;
+              aloneSince = null;
+              return false;
+            }
+
+            if (hasSeenOtherParticipant) {
+              if (aloneSince === null) {
+                aloneSince = now;
+                console.log('Bot is alone after previously seeing participants; waiting before ending recording.');
+              }
+              return now - aloneSince >= loneParticipantExitDelayMs;
+            }
+
+            return now - recordingStartedAt >= initialAloneGraceMs;
+          };
 
           function detectLoneParticipantResilient(): void {
             const re = /^[0-9]+$/;
@@ -672,11 +1113,11 @@ export class GoogleMeetBot extends MeetBotBase {
               function findPeopleButton() {
                 try {
                   // 1. Try to locate using attribute "starts with"
-                  let btn: Element | null | undefined = document.querySelector('button[aria-label^="People -"]');
+                  let btn: Element | null | undefined = document.querySelector('button[aria-label^="People -"], button[aria-label^="Personen -"]');
                   if (btn) return btn;
 
                   // 2. Try to locate using attribute "contains"
-                  btn = document.querySelector('button[aria-label*="People"]');
+                  btn = document.querySelector('button[aria-label*="People"], button[aria-label*="Personen"]');
                   if (btn) return btn;
 
                   // 3. Try via aria-labelledby pointing to element with "People" text
@@ -685,7 +1126,7 @@ export class GoogleMeetBot extends MeetBotBase {
                     const labelledBy = b.getAttribute('aria-labelledby');
                     if (labelledBy) {
                       const labelElement = document.getElementById(labelledBy);
-                      if (labelElement && labelElement.textContent?.trim() === 'People') {
+                      if (labelElement && ['People', 'Personen'].includes(labelElement.textContent?.trim() || '')) {
                         return true;
                       }
                     }
@@ -697,7 +1138,7 @@ export class GoogleMeetBot extends MeetBotBase {
                   const allBtnsWithLabel = Array.from(document.querySelectorAll('button[aria-label]'));
                   btn = allBtnsWithLabel.find(b => {
                     const label = b.getAttribute('aria-label');
-                    return label && /^People - \d+ joined$/.test(label);
+                    return label && (/^People - \d+ joined$/.test(label) || /^Personen - \d+/.test(label));
                   });
                   if (btn) return btn;
 
@@ -820,7 +1261,7 @@ export class GoogleMeetBot extends MeetBotBase {
                     return;
                   }
                   detectionFailures = 0;
-                  if (contributors < 2) {
+                  if (shouldStopForParticipantCount(contributors)) {
                     console.log('Bot is alone, ending meeting.');
                     loneTestDetectionActive = false;
                     stopTheRecording();
@@ -833,7 +1274,7 @@ export class GoogleMeetBot extends MeetBotBase {
                   return;
                 }
                 retryWithBackoff();
-              }, 5000);
+              }, 2000);
             }
           
             retryWithBackoff();
@@ -931,9 +1372,7 @@ export class GoogleMeetBot extends MeetBotBase {
           /**
            * Perpetual checks for inactivity detection
            */
-          inactivityParticipantDetectionTimeout = setTimeout(() => {
-            detectLoneParticipantResilient();
-          }, activateInactivityDetectionAfterMinutes * 60 * 1000);
+          detectLoneParticipantResilient();
 
           inactivitySilenceDetectionTimeout = setTimeout(() => {
             detectIncrediblySilentMeeting();
@@ -945,9 +1384,9 @@ export class GoogleMeetBot extends MeetBotBase {
             dismissModalsInterval = setInterval(() => {
               try {
                 const buttons = document.querySelectorAll('button');
-                const dismissButtons = Array.from(buttons).filter((button) => button?.offsetParent !== null && button?.innerText?.includes('Got it'));
+                const dismissButtons = Array.from(buttons).filter((button) => button?.offsetParent !== null && /Got it|Ok/i.test(button?.innerText || ''));
                 if (dismissButtons.length > 0) {
-                  console.log('Found "Got it" button, clicking it...', dismissButtons[0]);
+                  console.log('Found dismiss button, clicking it...', dismissButtons[0]);
                   dismissButtons[0].click();
                 }
 
@@ -956,7 +1395,9 @@ export class GoogleMeetBot extends MeetBotBase {
                 if (bodyText.includes('Microphone not found') ||
                     bodyText.includes('Make sure your microphone is plugged in') ||
                     bodyText.includes('Camera not found') ||
-                    bodyText.includes('Make sure your camera is plugged in')) {
+                    bodyText.includes('Make sure your camera is plugged in') ||
+                    bodyText.includes('Mikrofonproblem') ||
+                    bodyText.includes('Kameraproblem')) {
                   console.log('Found device notification (microphone/camera), attempting to dismiss...');
                   // Look for close button (X) near the notification
                   const allButtons = Array.from(document.querySelectorAll('button'));
@@ -1005,14 +1446,15 @@ export class GoogleMeetBot extends MeetBotBase {
                   return false;
                 }
 
-                if (currentBodyText.includes('No one responded to your request to join the call')) {
+                if (currentBodyText.includes('No one responded to your request to join the call') ||
+                    currentBodyText.includes('Niemand hat auf Ihre Teilnahmeanfrage geantwortet')) {
                   console.warn('Bot was not admitted to the meeting - ending recording on team:', userId, teamId);
                   return false;
                 }
 
                 // Check for basic Google Meet UI elements
-                const hasMeetElements = document.querySelector('button[aria-label="People"]') !== null ||
-                                      document.querySelector('button[aria-label="Leave call"]') !== null;
+                const hasMeetElements = document.querySelector('button[aria-label="People"], button[aria-label^="People -"], button[aria-label="Personen"], button[aria-label^="Personen -"]') !== null ||
+                                      document.querySelector('button[aria-label="Leave call"], button[aria-label="Anruf verlassen"]') !== null;
 
                 if (!hasMeetElements) {
                   console.warn('Google Meet UI elements not found - page may have changed state');
@@ -1054,12 +1496,14 @@ export class GoogleMeetBot extends MeetBotBase {
         teamId,
         duration,
         inactivityLimit,
+        loneParticipantExitDelayMs,
         userId,
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
-        primaryMimeType: webmMimeType,
-        secondaryMimeType: vp9MimeType
+        primaryMimeType,
+        secondaryMimeType,
+        mixBotMic: this._voiceEnabled,
       }
     );
   
