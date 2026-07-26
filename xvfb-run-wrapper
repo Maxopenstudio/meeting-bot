@@ -26,6 +26,18 @@ wait_for_pulseaudio() {
 # reboot. No other X server can be running here, so the locks are always ours.
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 
+# Chrome's SingletonLock in the persistent keeper profile (bind mount) survives
+# a non-graceful stop, and the recreated container has a new hostname — Chrome
+# then refuses the profile ("in use by another computer", exit 21). At wrapper
+# start no Chrome of ours is running yet, so any lock here is stale. The only
+# other legitimate profile user is the chrome-login container, and that RUNBOOK
+# procedure stops the keeper first (restart=unless-stopped keeps it stopped).
+if [ -n "$GOOGLE_CHROME_USER_DATA_DIR" ] && [ -d "$GOOGLE_CHROME_USER_DATA_DIR" ]; then
+    rm -f "$GOOGLE_CHROME_USER_DATA_DIR/SingletonLock" \
+          "$GOOGLE_CHROME_USER_DATA_DIR/SingletonSocket" \
+          "$GOOGLE_CHROME_USER_DATA_DIR/SingletonCookie"
+fi
+
 # Start Xvfb (800px height to accommodate 80px offset for address bar)
 Xvfb :99 -screen 0 1280x800x24 &
 xvfb_pid=$!
