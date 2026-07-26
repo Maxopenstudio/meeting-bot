@@ -60,6 +60,14 @@ for _ in {1..10}; do
     sleep 0.1
 done
 
+# Stale Pulse state survives a container restart the same way the X lock does:
+# /run/user/<uid> is plain container FS (not tmpfs), and after a restart PIDs
+# start over from 1 — so a leftover pulse/pid can point at a live (unrelated)
+# process, making the daemon believe it's already running: "Daemon startup
+# failed." Only reached when no daemon is actually up (the --kill/pgrep above),
+# so the state is always ours to discard.
+rm -rf "$XDG_RUNTIME_DIR/pulse" /tmp/pulse-*
+
 # Start PulseAudio in user mode
 pulseaudio -D --exit-idle-time=-1 --log-level=info 2>&1
 
