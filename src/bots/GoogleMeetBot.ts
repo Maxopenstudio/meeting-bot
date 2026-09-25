@@ -15,6 +15,7 @@ import createBrowserContext, { isExternalBrowserContext, persistGoogleSessionSta
 import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
 import { getRecordingMimeTypesForExtension } from '../lib/recording';
 import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
+import { DEFAULT_TRACKER_OPTIONS, SpeakerTimelineCollector, speakerTrackerInit } from '../lib/speakerTimeline';
 
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
@@ -136,6 +137,17 @@ export class GoogleMeetBot extends MeetBotBase {
     if (voiceEnabled) {
       await this.page.context().grantPermissions(['microphone'], { origin: 'https://meet.google.com' }).catch((e) =>
         this._logger.warn('Voice mode: grantPermissions(microphone) failed (continuing)', { error: (e as Error).message }),
+      );
+    }
+
+    // Speaker timeline tracker must be in place before Meet's scripts run, so
+    // its RTCPeerConnection wrapper sees every connection (survives reloads).
+    if (config.speakerTimelineEnabled) {
+      await this.page.addInitScript(speakerTrackerInit, {
+        ...DEFAULT_TRACKER_OPTIONS,
+        speakingClasses: config.meetSpeakingClasses,
+      }).catch((e) =>
+        this._logger.warn('Speaker timeline: addInitScript failed (continuing without it)', { error: (e as Error).message }),
       );
     }
 
@@ -897,6 +909,25 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     });
 
+    // Speaker timeline: the page tracker (installed before navigation) pushes
+    // closed intervals here; resolved into metadata.speakerTimeline on stop.
+    const speakerCollector = new SpeakerTimelineCollector((d) =>
+      this._logger.info('Speaker timeline diag', { tiles: d.tiles, rtcSources: d.rtcSources, togglingClasses: d.toggling }),
+    );
+    let rosterPoll: NodeJS.Timeout | undefined;
+    if (config.speakerTimelineEnabled) {
+      await this.page.exposeFunction('talkbaseSpeakerEvents', (msg: any) => {
+        try { speakerCollector.handle(msg); } catch { /* never break the recorder */ }
+      });
+      // Tile names only exist for tiles on screen; the roster adds everyone
+      // else as a candidate for the backend's name matching.
+      const pollRoster = async () => speakerCollector.addParticipants(
+        (await this.readMeetRoster()).filter((n) => !/talkbase|notetaker/i.test(n)),
+      );
+      rosterPoll = setInterval(() => { pollRoster().catch(() => undefined); }, 60000);
+      pollRoster().catch(() => undefined);
+    }
+
     const { primaryMimeType, secondaryMimeType } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
@@ -1009,6 +1040,8 @@ export class GoogleMeetBot extends MeetBotBase {
           const chunkDuration = 2000;
           mediaRecorder.start(chunkDuration);
           const recordingStartedAt = Date.now();
+          // Zero of the speaker timeline = zero of the recorded file.
+          (window as any).__tbSpeakers?.markRecordingStart(recordingStartedAt);
           const initialAloneGraceMs = activateInactivityDetectionAfterMinutes * 60 * 1000;
 
           let dismissModalsInterval: NodeJS.Timeout;
@@ -1055,6 +1088,13 @@ export class GoogleMeetBot extends MeetBotBase {
                 if (lastDimissError && lastDimissError instanceof Error) {
                   console.error('Error dismissing modals:', { lastDimissError, message: lastDimissError?.message });
                 }
+              }
+
+              // Push the still-open speaker intervals before Node wraps up.
+              try {
+                await (window as any).__tbSpeakers?.flushNow();
+              } catch (e) {
+                console.warn('Speaker timeline final flush failed', e);
               }
 
               // Begin browser cleanup
@@ -1519,5 +1559,18 @@ export class GoogleMeetBot extends MeetBotBase {
     });
 
     await waitingPromise.promise;
+
+    if (rosterPoll) clearInterval(rosterPoll);
+    if (config.speakerTimelineEnabled) {
+      try {
+        const timeline = speakerCollector.build();
+        uploader.setSpeakerTimeline(timeline);
+        this._logger.info('Speaker timeline built', timeline
+          ? { segments: timeline.segments.length, participants: timeline.participants, stats: timeline.stats }
+          : { segments: 0, reason: 'recording start (t0) never reported' });
+      } catch (e) {
+        this._logger.warn('Speaker timeline build failed (uploading without it)', { error: (e as Error).message });
+      }
+    }
   }
 }

@@ -50,6 +50,8 @@ export interface IUploader {
   uploadRecordingToRemoteStorage(options?: { forceUpload?: boolean }): Promise<boolean>;
   saveDataToTempFile(data: Buffer): Promise<boolean>;
   setRecordingDuration(durationSeconds: number): void;
+  // Who-spoke-when timeline, sent with the completion notice (metadata.speakerTimeline).
+  setSpeakerTimeline(timeline: Record<string, any> | null): void;
 }
 
 // Save to disk and upload in one session
@@ -81,6 +83,7 @@ class DiskUploader implements IUploader {
   private lastRecordingId?: string;
   private lastStorageDetails?: Record<string, any>;
   private recordingDuration?: number;
+  private speakerTimeline?: Record<string, any>;
   private firstChunkReceivedAt?: number;
 
   private queue: Buffer[];
@@ -322,6 +325,10 @@ class DiskUploader implements IUploader {
       this._logger.info('Error: Unable to save the chunk to disk...', this._userId, this._teamId, err);
       return false;
     }
+  }
+
+  public setSpeakerTimeline(timeline: Record<string, any> | null): void {
+    this.speakerTimeline = timeline ?? undefined;
   }
 
   public setRecordingDuration(durationSeconds: number): void {
@@ -799,6 +806,7 @@ class DiskUploader implements IUploader {
               uploaderType: config.uploaderType,
               duration: this.recordingDuration,
               storage: this.lastStorageDetails,
+              ...(this.speakerTimeline ? { speakerTimeline: this.speakerTimeline } : {}),
             },
           };
           await notifyRecordingCompleted(payload, this._logger);

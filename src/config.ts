@@ -127,6 +127,15 @@ export default {
   // is captured from this PulseAudio monitor (the default output sink).
   sonioxApiKey: process.env.SONIOX_API_KEY,
   meetingAudioSource: process.env.MEETING_AUDIO_SOURCE ?? 'virtual_output.monitor',
+  // Speaker timeline (who spoke when) — recorded in the Meet page and sent with
+  // the completion notice so the backend can put real names on diarized
+  // clusters. SPEAKER_TIMELINE_ENABLED=false turns the page tracker off.
+  speakerTimelineEnabled: process.env.SPEAKER_TIMELINE_ENABLED !== 'false',
+  // Obfuscated Meet classes that mark a "speaking" indicator inside a tile.
+  // Meet rotates these; the tracker logs toggling classes (SpeakerTimeline
+  // debug) so a new set can be dropped in here without a rebuild.
+  meetSpeakingClasses: (process.env.MEET_SPEAKING_CLASSES ?? 'Oaajhc,HX2H7,wEsLMd,OgVli')
+    .split(',').map((s) => s.trim()).filter(Boolean),
   // Wake phrases that summon the bot (lowercased, matched anywhere in the utterance).
   wakeWords: (process.env.BOT_WAKE_WORDS ?? 'толкбейз,talkbase,толк бейз,talk base').split(','),
   // Slang nicknames that ALSO summon the bot, but only in address position (the
