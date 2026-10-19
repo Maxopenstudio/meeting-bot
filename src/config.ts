@@ -95,6 +95,12 @@ export default {
   inactivityLimit: process.env.MEETING_INACTIVITY_MINUTES ? Number(process.env.MEETING_INACTIVITY_MINUTES) : 1,
   activateInactivityDetectionAfter: process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES ? Number(process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES) :  1,
   loneParticipantExitDelaySeconds: process.env.LONE_PARTICIPANT_EXIT_DELAY_SECONDS ? Number(process.env.LONE_PARTICIPANT_EXIT_DELAY_SECONDS) : 10,
+  // Google Meet: end the recording (upload what we have, leave) once the page has
+  // been stuck on "You lost your network connection / Trying to reconnect" this
+  // long. Otherwise the bot sits in the reconnect loop until maxRecordingDuration
+  // (3h), and both prod cases (2026-10-16, 2026-10-19) were followed by the
+  // shared Google session dying ~20-30 min later.
+  meetNetworkLossExitSeconds: process.env.MEET_NETWORK_LOSS_EXIT_SECONDS ? Number(process.env.MEET_NETWORK_LOSS_EXIT_SECONDS) : 120,
   serviceKey: process.env.SCREENAPP_BACKEND_SERVICE_API_KEY,
   joinWaitTime: process.env.JOIN_WAIT_TIME_MINUTES ? Number(process.env.JOIN_WAIT_TIME_MINUTES) : 10,
   // Number of retries for transient errors (not applied to WaitingAtLobbyRetryError)

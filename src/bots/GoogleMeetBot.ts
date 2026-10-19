@@ -879,6 +879,7 @@ export class GoogleMeetBot extends MeetBotBase {
     const duration = config.maxRecordingDuration * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
     const loneParticipantExitDelayMs = config.loneParticipantExitDelaySeconds * 1000;
+    const networkLossExitMs = config.meetNetworkLossExitSeconds * 1000;
 
     // Capture and send the browser console logs to Node.js context
     this.page?.on('console', async msg => {
@@ -932,8 +933,8 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType, mixBotMic }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string, mixBotMic: boolean }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, networkLossExitMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, primaryMimeType, secondaryMimeType, mixBotMic }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, networkLossExitMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, primaryMimeType: string, secondaryMimeType: string, mixBotMic: boolean }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -1470,6 +1471,11 @@ export class GoogleMeetBot extends MeetBotBase {
           };
 
           const detectMeetingIsOnAValidPage = () => {
+            // When the page first showed the network-loss banner (null = connected).
+            // The Meet UI stays "valid" (Leave call / People buttons remain) while it
+            // tries to reconnect, so this needs its own timer.
+            let networkLostSince: number | null = null;
+
             // Simple check to verify we're still on a supported Google Meet page
             const isOnValidGoogleMeetPage = () => {
               try {
@@ -1490,6 +1496,24 @@ export class GoogleMeetBot extends MeetBotBase {
                     currentBodyText.includes('Niemand hat auf Ihre Teilnahmeanfrage geantwortet')) {
                   console.warn('Bot was not admitted to the meeting - ending recording on team:', userId, teamId);
                   return false;
+                }
+
+                const networkLost = currentBodyText.includes('You lost your network connection') ||
+                                    currentBodyText.includes('Trying to reconnect');
+                if (!networkLost) {
+                  if (networkLostSince !== null) {
+                    console.log('Network connection to the meeting restored after', Math.round((Date.now() - networkLostSince) / 1000), 's');
+                  }
+                  networkLostSince = null;
+                } else {
+                  const now = Date.now();
+                  if (networkLostSince === null) {
+                    networkLostSince = now;
+                    console.warn('Meet reports lost network connection; ending recording if it persists', Math.round(networkLossExitMs / 1000), 's');
+                  } else if (now - networkLostSince >= networkLossExitMs) {
+                    console.warn('Meet network connection lost for', Math.round((now - networkLostSince) / 1000), 's - ending recording on team:', userId, teamId);
+                    return false;
+                  }
                 }
 
                 // Check for basic Google Meet UI elements
@@ -1537,6 +1561,7 @@ export class GoogleMeetBot extends MeetBotBase {
         duration,
         inactivityLimit,
         loneParticipantExitDelayMs,
+        networkLossExitMs,
         userId,
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
